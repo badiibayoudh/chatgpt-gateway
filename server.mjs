@@ -2,14 +2,17 @@
 // HTTP API + WebSocket relay to Chrome extension
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { WebSocketServer } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
+import { prepareChat } from "./chat-tools.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
+const MAX_BROWSER_WAIT = 240_000;
 
 // Pending HTTP requests waiting for extension response
-const pending = new Map(); // requestId -> { socket, resolve, reject, timer }
+const pending = new Map();
 
 let extensionWs = null;
+let activeRequest = null;
 
 // ── WebSocket server (extension connects here) ────────────
 
@@ -27,15 +30,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "response" && pending.get(msg.requestId)?.socket === ws) {
-      console.log(`[gateway] Received browser reply for ${msg.requestId} (ok=${msg.ok})`);
-      resolveRequest(msg.requestId, msg);
-    }
+    if (msg.type === "response") finishBrowserRequest(ws, msg.requestId, msg);
   });
 
   ws.on("close", () => {
     console.log("[gateway] Extension disconnected");
     if (extensionWs === ws) extensionWs = null;
+    if (activeRequest?.socket === ws) releaseBrowser();
     for (const [requestId, entry] of pending) {
       if (entry.socket === ws) {
         resolveRequest(requestId, {
@@ -44,10 +45,45 @@ wss.on("connection", (ws) => {
         });
       }
     }
+    dispatchNextRequest();
   });
 });
 
 // ── Helpers ────────────────────────────────────────────────
+
+function dispatchNextRequest() {
+  if (activeRequest || !pending.size) return;
+  const [requestId, { socket, message }] = pending.entries().next().value;
+  if (socket.readyState !== WebSocket.OPEN) return; // The close handler releases its requests.
+
+  const timer = setTimeout(() => {
+    console.warn(`[gateway] Resetting stalled browser connection for ${requestId}`);
+    socket.terminate();
+  }, MAX_BROWSER_WAIT);
+  activeRequest = { socket, requestId, timer };
+  console.log(`[gateway] Sent request ${requestId} to the browser extension`);
+  socket.send(JSON.stringify(message), (err) => {
+    if (err) {
+      finishBrowserRequest(socket, requestId, {
+        ok: false,
+        error: "Could not send request to the browser extension",
+      });
+    }
+  });
+}
+
+function releaseBrowser() {
+  clearTimeout(activeRequest.timer);
+  activeRequest = null;
+}
+
+function finishBrowserRequest(socket, requestId, result) {
+  if (activeRequest?.socket !== socket || activeRequest.requestId !== requestId) return;
+  console.log(`[gateway] Received browser reply for ${requestId} (ok=${result.ok})`);
+  releaseBrowser();
+  resolveRequest(requestId, result);
+  dispatchNextRequest();
+}
 
 function resolveRequest(requestId, result) {
   const entry = pending.get(requestId);
@@ -66,7 +102,7 @@ function cleanupRequest(requestId) {
   }
 }
 
-function sendCompletion(res, payload, requestId, content) {
+function sendCompletion(res, payload, requestId, { content, toolCalls }) {
   const completion = {
     id: `chatcmpl-${requestId}`,
     created: Math.floor(Date.now() / 1000),
@@ -74,13 +110,18 @@ function sendCompletion(res, payload, requestId, content) {
   };
   const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   const message = { role: "assistant", content };
+  const finishReason = toolCalls ? "tool_calls" : "stop";
+  if (toolCalls) message.tool_calls = toolCalls;
 
   if (payload.stream === true) {
     const chunk = { ...completion, object: "chat.completion.chunk" };
     const includeUsage = payload.stream_options?.include_usage === true;
+    const delta = toolCalls
+      ? { role: "assistant", tool_calls: toolCalls.map((call, index) => ({ index, ...call })) }
+      : message;
     const events = [
-      { ...chunk, choices: [{ index: 0, delta: message, finish_reason: null }] },
-      { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+      { ...chunk, choices: [{ index: 0, delta, finish_reason: null }] },
+      { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] },
     ];
     if (includeUsage) {
       for (const event of events) event.usage = null;
@@ -101,7 +142,7 @@ function sendCompletion(res, payload, requestId, content) {
     JSON.stringify({
       ...completion,
       object: "chat.completion",
-      choices: [{ index: 0, message, finish_reason: "stop" }],
+      choices: [{ index: 0, message, finish_reason: finishReason }],
       usage,
     })
   );
@@ -155,6 +196,9 @@ const server = createServer(async (req, res) => {
       let body = "";
       for await (const chunk of req) body += chunk;
       payload = JSON.parse(body);
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected request object");
+      }
     } catch {
       if (res.destroyed) return;
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -162,8 +206,18 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const requestId = randomUUID();
+    let chat;
+    try {
+      chat = prepareChat(payload, requestId);
+    } catch (err) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { message: err.message, type: "invalid_request_error" } }));
+      return;
+    }
+
     const socket = extensionWs;
-    if (!socket || socket.readyState !== 1) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -174,37 +228,30 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const requestId = randomUUID();
     const timeoutMs = parseInt(payload.timeout || "90000", 10);
+    const message = {
+      type: "chat",
+      requestId,
+      model: payload.model || "auto",
+      messages: chat.messages,
+      newConversation: payload.new_conversation !== false,
+    };
 
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        const location = activeRequest?.requestId === requestId ? "ChatGPT response" : "an available browser tab";
         pending.delete(requestId);
-        console.warn(`[gateway] Timed out waiting for browser reply for ${requestId}`);
-        reject(new Error("Timeout waiting for ChatGPT response"));
+        console.warn(`[gateway] Timed out waiting for ${location} for ${requestId}`);
+        reject(new Error(`Timeout waiting for ${location}`));
       }, timeoutMs);
-      pending.set(requestId, { socket, resolve, reject, timer });
+      pending.set(requestId, { socket, message, resolve, reject, timer });
     });
 
     // The request body can finish while the client is still waiting for our reply.
     res.once("close", () => cleanupRequest(requestId));
 
-    // Send to extension
-    console.log(`[gateway] Sent request ${requestId} to the browser extension`);
-    socket.send(
-      JSON.stringify({
-        type: "chat",
-        requestId,
-        model: payload.model || "auto",
-        messages: payload.messages || [],
-        newConversation: payload.new_conversation !== false,
-      }),
-      (err) => {
-        if (err) {
-          resolveRequest(requestId, { ok: false, error: "Could not send request to the browser extension" });
-        }
-      }
-    );
+    // The browser can still be generating after an HTTP request is cancelled.
+    dispatchNextRequest();
 
     try {
       const result = await promise;
@@ -217,7 +264,16 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      sendCompletion(res, payload, requestId, result.content);
+      let completion;
+      try {
+        completion = chat.decode(result.content);
+      } catch (err) {
+        console.warn(`[gateway] Rejected browser reply for ${requestId}: ${err.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { message: err.message, type: "invalid_tool_call" } }));
+        return;
+      }
+      sendCompletion(res, payload, requestId, completion);
     } catch (err) {
       if (res.destroyed) return;
       res.writeHead(504, { "Content-Type": "application/json" });
@@ -243,15 +299,16 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 server.listen(PORT, () => {
+  const { port } = server.address();
   console.log(`
   ChatGPT Gateway Server
   ──────────────────────
-  HTTP API:    http://localhost:${PORT}/v1/chat/completions
-  Health:      http://localhost:${PORT}/health
-  WebSocket:   ws://localhost:${PORT}/ws
+  HTTP API:    http://localhost:${port}/v1/chat/completions
+  Health:      http://localhost:${port}/health
+  WebSocket:   ws://localhost:${port}/ws
 
   Usage:
-    curl -X POST http://localhost:${PORT}/v1/chat/completions \\
+    curl -X POST http://localhost:${port}/v1/chat/completions \\
       -H "Content-Type: application/json" \\
       -d '{"model":"auto","messages":[{"role":"user","content":"Say hi"}]}'
   `);

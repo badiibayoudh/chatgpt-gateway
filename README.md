@@ -98,6 +98,22 @@ const response = await client.chat.completions.create({
 console.log(response.choices[0].message.content);
 ```
 
+### Continue Agent mode
+
+Add `capabilities: [tool_use]` to the gateway model in Continue's `config.yaml`.
+
+```yaml
+models:
+  - name: ChatGPT-Gateway
+    provider: openai
+    model: auto
+    apiBase: http://localhost:18790/v1
+    apiKey: unused
+    capabilities: [tool_use]
+```
+
+Reload Continue's config and select this model in **Agent** mode. Attach the Python file and ask Continue to edit it. If **Edit File** is set to **Ask First**, click **Continue** on the tool card and review the resulting diff. Continue runs the tool and sends its result back through the gateway.
+
 ## API
 
 ### `POST /v1/chat/completions`
@@ -109,8 +125,11 @@ OpenAI-compatible chat completions endpoint.
 | `messages` | array | required | Array of `{role, content}` message objects |
 | `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
 | `stream` | boolean | `false` | Return server-sent events after the browser finishes generating |
+| `tools` | array | `[]` | Function names, descriptions, and JSON Schema parameters supplied by the client |
+| `tool_choice` | string or object | `"auto"` | `auto`, `none`, `required`, or a named function object |
+| `parallel_tool_calls` | boolean | `true` | Set to `false` to allow at most one function call per reply |
 | `new_conversation` | boolean | `true` | Start a fresh chat for each request |
-| `timeout` | number | `90000` | Max wait time in ms for ChatGPT to respond |
+| `timeout` | number | `90000` | Max wait time in ms, including time in the browser queue |
 
 Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 
@@ -174,6 +193,7 @@ The `chatgpt_ask` tool supports progress notifications per the MCP spec — clie
 
 - **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
 - **Buffered replies.** Streaming clients receive the full text in one event after ChatGPT finishes generating.
+- **Browser-based tool calling.** The gateway describes client tools to ChatGPT as text and validates its structured reply before returning a tool call. Tool execution and approval happen in Continue.
 - **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
 - **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.
 

@@ -10,6 +10,7 @@
     "build:firefox": "mkdir -p dist && cd dist && rm -f chatgpt-gateway-firefox.zip && cp ../manifest.firefox.json manifest.json && zip -r chatgpt-gateway-firefox.zip manifest.json ../background.js ../content.js ../popup.html ../popup.js ../icons/ && rm manifest.json"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "ws": "^8.18.0"
   },
   "repository": {
