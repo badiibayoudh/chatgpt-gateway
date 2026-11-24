@@ -28,7 +28,7 @@ Content script on chatgpt.com
 ChatGPT (your logged-in browser session)
 ```
 
-The extension's content script types your message into ChatGPT's input field, clicks send, waits for the response to finish streaming, extracts the text, and returns it through the chain. The gateway server wraps the result in an OpenAI-compatible JSON response.
+The extension's content script types your message into ChatGPT's input field, clicks send, waits for the response to finish streaming, extracts the text, and returns it through the chain. The gateway server sends the result as an OpenAI-compatible JSON response or as server-sent events when the client requests streaming.
 
 ## Can I keep using my browser?
 
@@ -108,8 +108,9 @@ OpenAI-compatible chat completions endpoint.
 |---|---|---|---|
 | `messages` | array | required | Array of `{role, content}` message objects |
 | `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
+| `stream` | boolean | `false` | Return server-sent events after the browser finishes generating |
 | `new_conversation` | boolean | `true` | Start a fresh chat for each request |
-| `timeout` | number | `180000` | Max wait time in ms for ChatGPT to respond |
+| `timeout` | number | `90000` | Max wait time in ms for ChatGPT to respond |
 
 Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 
@@ -172,7 +173,7 @@ The `chatgpt_ask` tool supports progress notifications per the MCP spec — clie
 ## Limitations
 
 - **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
-- **No streaming.** Responses are returned after ChatGPT finishes generating. Streaming support may come later.
+- **Buffered replies.** Streaming clients receive the full text in one event after ChatGPT finishes generating.
 - **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
 - **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.
 

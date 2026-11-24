@@ -3,6 +3,7 @@
 "use strict";
 
 const GATEWAY_URL = "ws://localhost:18790/ws";
+const HEARTBEAT_INTERVAL = 20_000;
 let ws = null;
 let reconnectTimer = null;
 
@@ -11,17 +12,19 @@ function log(...args) {
 }
 
 function connect() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
+  let socket;
   try {
-    ws = new WebSocket(GATEWAY_URL);
+    socket = new WebSocket(GATEWAY_URL);
   } catch (err) {
     log("WebSocket constructor failed:", err.message);
     scheduleReconnect();
     return;
   }
+  ws = socket;
 
-  ws.onopen = () => {
+  socket.onopen = () => {
     log("Connected to gateway server");
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
@@ -29,7 +32,7 @@ function connect() {
     }
   };
 
-  ws.onmessage = async (event) => {
+  socket.onmessage = async (event) => {
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -38,20 +41,36 @@ function connect() {
       return;
     }
 
-    if (msg.type === "chat") {
-      await handleChatMessage(msg);
+    if (msg.type !== "chat") return;
+
+    // Chrome can suspend an idle worker while the tab is generating a reply.
+    const heartbeat = setInterval(() => {
+      sendToServer(socket, { type: "ping" });
+    }, HEARTBEAT_INTERVAL);
+    try {
+      await handleChatMessage(msg, socket);
+    } catch (err) {
+      sendToServer(socket, {
+        type: "response",
+        requestId: msg.requestId,
+        ok: false,
+        error: err.message,
+      });
+    } finally {
+      clearInterval(heartbeat);
     }
   };
 
-  ws.onclose = () => {
+  socket.onclose = () => {
     log("Disconnected from gateway server");
+    if (ws !== socket) return;
     ws = null;
     scheduleReconnect();
   };
 
-  ws.onerror = () => {
+  socket.onerror = () => {
     // onclose will fire after this
-    ws?.close();
+    socket.close();
   };
 }
 
@@ -61,18 +80,18 @@ function scheduleReconnect() {
   }
 }
 
-function sendToServer(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(data));
+function sendToServer(socket, data) {
+  if (socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(data));
   }
 }
 
-async function handleChatMessage(msg) {
+async function handleChatMessage(msg, socket) {
   // Find a ChatGPT tab
   const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
 
   if (tabs.length === 0) {
-    sendToServer({
+    sendToServer(socket, {
       type: "response",
       requestId: msg.requestId,
       ok: false,
@@ -84,10 +103,16 @@ async function handleChatMessage(msg) {
   // Extract the last user message
   const messages = msg.messages || [];
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const userMessage = lastUser?.content || "";
+  const content = lastUser?.content;
+  const userMessage = Array.isArray(content)
+    ? content
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("\n")
+    : content;
 
-  if (!userMessage) {
-    sendToServer({
+  if (typeof userMessage !== "string" || !userMessage) {
+    sendToServer(socket, {
       type: "response",
       requestId: msg.requestId,
       ok: false,
@@ -107,7 +132,7 @@ async function handleChatMessage(msg) {
         newConversation: msg.newConversation !== false,
       });
 
-      sendToServer({
+      sendToServer(socket, {
         type: "response",
         requestId: msg.requestId,
         ok: response.ok,
@@ -121,7 +146,7 @@ async function handleChatMessage(msg) {
   }
 
   // All tabs failed
-  sendToServer({
+  sendToServer(socket, {
     type: "response",
     requestId: msg.requestId,
     ok: false,

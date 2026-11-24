@@ -3,25 +3,81 @@
 (function () {
   "use strict";
 
-  const POLL_INTERVAL = 1500;
+  const POLL_INTERVAL = 750;
   const MAX_WAIT = 180_000; // 3 minutes
+  const LEGACY_ASSISTANT = '[data-message-author-role="assistant"]';
+  const ANSWER_BODY = '[data-markdown-text-style="assistant-message"], .markdown';
+  const ASSISTANT_MESSAGE = [
+    LEGACY_ASSISTANT,
+    '[data-turn="assistant"] .markdown',
+    '[data-chatgpt-search-unit-key$=":assistant"]',
+    '[data-markdown-text-style="assistant-message"]',
+  ].join(", ");
+  const COPY_REPLY = [
+    'button[data-testid="copy-turn-action-button"]',
+    'button[data-test-id="copy-turn-action-button"]',
+    '.turn-action-controls button[aria-label="Copy" i]',
+    '.turn-action-controls button[aria-label="Copy response" i]',
+    '.turn-action-controls button[aria-label="Kopieren" i]',
+  ].join(", ");
+  const STOP_GENERATION = [
+    'button[data-testid="stop-button"]',
+    'button[data-test-id="stop-button"]',
+    'button[aria-label="Stop generating" i]',
+    'button[aria-label="Stop streaming" i]',
+    'form[data-chatgpt-composer] button[aria-label="Stop" i]',
+    'form[data-chatgpt-composer] button[aria-label*="stopp" i]',
+    'form[data-chatgpt-composer] button[aria-label*="anhalten" i]',
+    'form[data-chatgpt-composer] button[aria-label*="beenden" i]',
+  ].join(", ");
 
   // ── Helpers ──────────────────────────────────────────────
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+
+
   function findInput() {
     const selectors = [
-      "#prompt-textarea",
-      'div[contenteditable="true"][id="prompt-textarea"]',
-      "textarea",
-      '[contenteditable="true"]',
+        'div.ProseMirror[contenteditable="true"]',
+        '#prompt-textarea',
+        '[contenteditable="true"]',
+        'textarea'
     ];
-    for (const sel of selectors) {
-      const el = document.querySelector(sel);
-      if (el && el.offsetParent !== null) return el;
+
+    for (const selector of selectors) {
+        const elements = document.querySelectorAll(selector);
+
+        for (const el of elements) {
+            const rect = el.getBoundingClientRect();
+
+            if (rect.width > 0 && rect.height > 0) {
+                console.log("[Gateway] Input found:", selector);
+                return el;
+            }
+        }
     }
+
     return null;
+ }
+
+  async function waitForInput(timeoutMs = 15000) {
+      const deadline = Date.now() + timeoutMs;
+
+      while (Date.now() < deadline) {
+          const input = findInput();
+
+          if (input) {
+              return input;
+          }
+
+          await sleep(500);
+      }
+
+      throw new Error(
+          "Cannot find ChatGPT input field after " +
+          timeoutMs + " ms"
+      );
   }
 
   function findSendButton() {
@@ -38,26 +94,40 @@
     return null;
   }
 
-  function countAssistantMessages() {
-    return document.querySelectorAll(
-      '[data-message-author-role="assistant"]'
-    ).length;
+  function findAssistantMessages() {
+    return document.querySelectorAll(ASSISTANT_MESSAGE);
   }
 
-  function getLatestAssistantText() {
-    const els = document.querySelectorAll(
-      '[data-message-author-role="assistant"]'
+  function getAssistantTurn(message) {
+    return (
+      message.closest('[data-turn="assistant"], [data-turn-key], [data-testid^="conversation-turn-"], [data-test-id^="conversation-turn-"]') ||
+      message.closest('[data-chatgpt-search-unit-key$=":assistant"]') ||
+      message.closest(LEGACY_ASSISTANT) ||
+      message
     );
-    if (els.length === 0) return "";
-    const last = els[els.length - 1];
-    return (last.textContent || "")
+  }
+
+  function getTurnId(turn) {
+    return (
+      turn.getAttribute("data-turn-id") ||
+      turn.getAttribute("data-turn-key") ||
+      turn.getAttribute("data-chatgpt-search-unit-key") ||
+      turn.getAttribute("data-message-id") ||
+      turn
+    );
+  }
+
+  function getAssistantText(message) {
+    const body = message.matches(ANSWER_BODY) ? message : message.querySelector(ANSWER_BODY);
+    const content = body || (message.matches(LEGACY_ASSISTANT) ? message : null);
+    return (content?.innerText ?? content?.textContent ?? "")
       .replace(/[\u200B-\u200D\uFEFF]/g, "")
       .trim();
   }
 
-  function isStreaming() {
-    return !!document.querySelector(
-      'button[aria-label="Stop streaming"], [data-testid="stop-button"], button[aria-label*="Stop"]'
+  function isGenerating() {
+    return Array.from(document.querySelectorAll(STOP_GENERATION)).some(
+      (button) => button.getClientRects().length > 0
     );
   }
 
@@ -84,7 +154,10 @@
   }
 
   async function selectModel(modelSlug) {
-    if (!modelSlug) return;
+    if (!modelSlug || modelSlug.toLowerCase() === "auto") {
+      return;
+    }
+    // if (!modelSlug) return;
 
     // Try clicking the model picker
     const pickerSelectors = [
@@ -123,7 +196,9 @@
   }
 
   async function typeMessage(text) {
-    const input = findInput();
+    const input = await waitForInput();
+    //const input = findInput();
+
     if (!input) throw new Error("Cannot find ChatGPT input field");
 
     input.focus();
@@ -187,40 +262,41 @@
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(beforeCount) {
+  async function waitForNewResponse(previousTurns) {
+    const deadline = Date.now() + MAX_WAIT;
+    let lastTurnId = null;
     let lastText = "";
     let stableCount = 0;
 
-    for (let elapsed = 0; elapsed < MAX_WAIT; elapsed += POLL_INTERVAL) {
-      await sleep(POLL_INTERVAL);
-
-      const currentCount = countAssistantMessages();
-      if (currentCount <= beforeCount) continue; // No new response yet
-
-      const text = getLatestAssistantText();
-      const streaming = isStreaming();
-
-      if (text && text !== lastText) {
-        lastText = text;
-        stableCount = 0;
-      } else if (text) {
-        stableCount++;
-        if (!streaming && stableCount >= 2) {
-          return text;
+    while (Date.now() < deadline) {
+      const messages = findAssistantMessages();
+      const message = messages[messages.length - 1];
+      if (message) {
+        const turn = getAssistantTurn(message);
+        const turnId = getTurnId(turn);
+        if (!previousTurns.has(turnId)) {
+          const text = getAssistantText(message);
+          const generating = isGenerating();
+          stableCount = !generating && text === lastText && turnId === lastTurnId ? stableCount + 1 : 0;
+          lastTurnId = turnId;
+          lastText = text;
+          if (text && !generating && (turn.querySelector(COPY_REPLY) || stableCount >= 2)) {
+            return text;
+          }
         }
       }
+      await sleep(POLL_INTERVAL);
     }
 
-    if (lastText) return lastText;
-    throw new Error("Timeout: no response from ChatGPT");
+    throw new Error(lastText
+      ? "Timeout: ChatGPT started replying but did not finish"
+      : "Timeout: could not find the new ChatGPT reply on the page");
   }
 
   // ── Message handler ──────────────────────────────────────
 
   async function handleChatRequest(msg) {
     try {
-      const beforeCount = countAssistantMessages();
-
       // Start new conversation if requested
       if (msg.newConversation !== false) {
         await startNewChat();
@@ -228,9 +304,12 @@
       }
 
       await typeMessage(msg.userMessage);
+      const previousTurns = new Set(
+        Array.from(findAssistantMessages(), (message) => getTurnId(getAssistantTurn(message)))
+      );
       await clickSend();
 
-      const response = await waitForNewResponse(beforeCount);
+      const response = await waitForNewResponse(previousTurns);
 
       return { ok: true, content: response };
     } catch (err) {
