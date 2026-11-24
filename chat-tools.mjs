@@ -1,5 +1,7 @@
 import Ajv from "ajv";
+import Ajv2020 from "ajv/dist/2020.js";
 
+const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
 const JSON_REPLY_FORMAT = "Put exactly one JSON object in a fenced code block labeled json. Do not add text outside the block.";
 
 function isObject(value) {
@@ -174,16 +176,23 @@ export function prepareChat(payload, requestId) {
     };
   }
 
-  const ajv = new Ajv({
+  const validatorOptions = {
     strict: false,
     ownProperties: true,
     validateFormats: false,
     addUsedSchema: false,
-  });
+  };
+  let draft7;
+  let draft2020;
   const validators = new Map();
   for (const { name, parameters } of functions) {
     try {
-      const validate = ajv.compile(parameters ?? { type: "object", additionalProperties: false });
+      const schema = parameters ?? { type: "object", additionalProperties: false };
+      const dialect = schema.$schema;
+      const ajv = dialect === DRAFT_2020_12 || dialect === DRAFT_2020_12 + "#"
+        ? (draft2020 ??= new Ajv2020(validatorOptions))
+        : (draft7 ??= new Ajv(validatorOptions));
+      const validate = ajv.compile(schema);
       if (validate.$async) throw new Error("Async schemas are unsupported");
       validators.set(name, validate);
     } catch (err) {

@@ -125,7 +125,7 @@ OpenAI-compatible chat completions endpoint.
 | `messages` | array | required | Array of `{role, content}` message objects |
 | `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
 | `stream` | boolean | `false` | Return server-sent events after the browser finishes generating |
-| `tools` | array | `[]` | Function names, descriptions, and JSON Schema parameters supplied by the client |
+| `tools` | array | `[]` | Function definitions with draft-07 or 2020-12 JSON Schema parameters |
 | `tool_choice` | string or object | `"auto"` | `auto`, `none`, `required`, or a named function object |
 | `parallel_tool_calls` | boolean | `true` | Set to `false` to allow at most one function call per reply |
 | `new_conversation` | boolean | `true` | Start a fresh chat for each request |
@@ -193,7 +193,7 @@ The `chatgpt_ask` tool supports progress notifications per the MCP spec — clie
 
 - **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
 - **Buffered replies.** Streaming clients receive the full text in one event after ChatGPT finishes generating.
-- **Browser-based tool calling.** The gateway describes client tools to ChatGPT as text and validates its structured reply before returning a tool call. Tool execution and approval happen in Continue.
+- **Browser-based tool calling.** The gateway describes client tools to ChatGPT as text and validates its structured reply before returning a tool call. The IDE client handles tool execution and approval.
 - **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
 - **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.
 

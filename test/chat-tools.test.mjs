@@ -104,6 +104,34 @@ test("rejects malformed, unlisted, stale, and schema-invalid calls", () => {
   assert.throws(() => decode(envelope([{ ...call, arguments: { ...args, extra: 4 } }])), /invalid arguments/);
 });
 
+test("validates Cline 2020-12 tools alongside Continue tools", () => {
+  const ask = {
+    type: "function",
+    function: {
+      name: "ask_question",
+      parameters: {
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: {
+          question: { type: "string", minLength: 1 },
+          options: { type: "array", minItems: 2, maxItems: 5, items: { type: "string", minLength: 1 } },
+        },
+        required: ["question", "options"],
+        additionalProperties: false,
+      },
+    },
+  };
+  const { decode } = prepareChat({ tools: [ask, edit], messages: [user] }, requestId);
+  const question = { name: ask.function.name, arguments: { question: "Which file?", options: ["a.py", "b.py"] } };
+
+  const { toolCalls } = decode(envelope([question, call]));
+  assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), question.arguments);
+  assert.deepEqual(JSON.parse(toolCalls[1].function.arguments), args);
+  assert.throws(() => decode(envelope([
+    { ...question, arguments: { ...question.arguments, options: ["a.py"] } },
+  ])), /invalid arguments for ask_question/);
+});
+
 test("enforces none, required, named, and single-call choices", () => {
   const tools = [edit, read];
   const content = envelope([call]);
