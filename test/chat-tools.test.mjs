@@ -91,6 +91,28 @@ test("retains earlier text when its image exceeds the attachment allowance", () 
   assert.equal(transcript.at(-1).content, "Screenshot description 8\n[Attached image: image-9.png]");
 });
 
+test("counts the latest Cline tool batch separately from earlier screenshot batches", () => {
+  const result = (index) => [
+    { role: "tool", tool_call_id: `screenshot-${index}`, content: `Screenshot description ${index}` },
+    { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] },
+  ];
+  const batch = (...indices) => [{
+    role: "assistant", tool_calls: indices.map((index) => ({ id: `screenshot-${index}` })),
+  }, ...indices.flatMap(result)];
+  const older = Array.from({ length: 9 }, (_, index) => batch(index)).flat();
+  const messages = [user, ...older, ...batch(9, 10)];
+  const { attachments, messages: [prompt] } = prepareChat({ messages }, requestId);
+  const transcript = JSON.parse(prompt.content.split("Conversation (JSON):\n\n")[1]);
+  assert.equal(attachments.length, 8);
+  assert.equal(transcript[2].content, "Screenshot description 0");
+  assert.equal(transcript[3].content, "[Earlier image unavailable: image-1.png]");
+  assert.deepEqual(attachments.slice(-2).map(({ name }) => name), ["image-10.png", "image-11.png"]);
+  assert.equal(transcript.at(-1).content, "[Attached image: image-11.png]");
+
+  const oversized = batch(...Array.from({ length: 9 }, (_, index) => index));
+  assert.throws(() => prepareChat({ messages: [user, ...oversized] }, requestId), /8 images and 20 MiB/);
+});
+
 test("passes the system prompt, selected source, prior function call and tool result", () => {
   const messages = [
     { role: "system", content: "Call the edit tool for workspace changes." },

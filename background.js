@@ -27,7 +27,7 @@ function connect() {
 
   socket.onopen = () => {
     log("Connected to gateway server");
-    sendToServer(socket, { type: "hello", capabilities: ["imageAttachments", "conversationReuse"] });
+    sendToServer(socket, { type: "hello", capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly"] });
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
@@ -98,11 +98,28 @@ function userText(messages = []) {
     : content;
 }
 
-async function handleChatMessage(msg, socket) {
-  // Find a ChatGPT tab
-  const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
+function chatUrl(url) {
+  return url?.split(/[?#]/)[0].replace(/\/$/, "");
+}
 
-  if (tabs.length === 0) {
+async function isConversationReady(tabId, url) {
+  const page = await chrome.tabs.sendMessage(tabId, { type: "ping" }).catch(() => null);
+  return page?.ok && chatUrl(page.url) === chatUrl(url);
+}
+
+async function reopenConversation(url) {
+  const tab = await chrome.tabs.create({ url, active: false });
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (await isConversationReady(tab.id, url)) return tab;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error("Could not reopen the ChatGPT chat for this task. Open or refresh that chat and retry.");
+}
+
+async function handleChatMessage(msg, socket) {
+  const continuation = msg.continuation;
+  const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
+  if (!continuation && tabs.length === 0) {
     sendToServer(socket, {
       type: "response",
       requestId: msg.requestId,
@@ -112,7 +129,8 @@ async function handleChatMessage(msg, socket) {
     return;
   }
 
-  const userMessage = userText(msg.messages);
+  const { messages, attachments } = continuation ?? msg;
+  const userMessage = userText(messages);
 
   if (typeof userMessage !== "string" || !userMessage) {
     sendToServer(socket, {
@@ -124,30 +142,56 @@ async function handleChatMessage(msg, socket) {
     return;
   }
 
-  const continuation = msg.continuation;
-  const preferred = continuation && tabs.find((tab) => tab.id === continuation.tabId &&
-    tab.url?.split(/[?#]/)[0] === continuation.url.split(/[?#]/)[0]);
-  const candidates = preferred ? [preferred, ...tabs.filter((tab) => tab !== preferred)] : tabs;
+  const expectedConversation = continuation?.url;
+  let candidates = tabs;
+  if (continuation) {
+    const matches = tabs.filter((tab) => chatUrl(tab.url) === chatUrl(expectedConversation));
+    const ready = await Promise.all(matches.map(({ id }) => isConversationReady(id, expectedConversation)));
+    candidates = matches.filter((_, index) => ready[index]);
+    candidates.sort((left, right) => Number(right.id === continuation.tabId) - Number(left.id === continuation.tabId));
+    if (!candidates.length) candidates.push(await reopenConversation(expectedConversation));
+  }
   const errors = [];
   for (const tab of candidates) {
     try {
       if (msg.streamText) streamingRequests.set(msg.requestId, { socket, tabId: tab.id });
-      const send = (text, attachments, newConversation, expectedConversation) => chrome.tabs.sendMessage(tab.id, {
+      const send = (text, files, newConversation, expectedDraftUrl) => chrome.tabs.sendMessage(tab.id, {
         type: "chat",
         requestId: msg.requestId,
         model: msg.model,
         userMessage: text,
-        attachments,
+        attachments: files,
         streamText: msg.streamText,
         newConversation,
         expectedConversation,
+        expectedDraftUrl,
       });
-      let response;
-      if (tab === preferred) {
-        response = await send(userText(continuation.messages), continuation.attachments, false, continuation.url);
-      }
-      if (!response || response.conversationChanged) {
-        response = await send(userMessage, msg.attachments, msg.newConversation !== false);
+      const newConversation = !continuation && msg.newConversation !== false;
+      let response = await send(userMessage, attachments, newConversation);
+      if (response.conversationChanged) throw new Error("ChatGPT navigated away from the task chat. Retry to reopen it.");
+      if (response.errorCode === "chatgpt_input_too_long" || response.errorCode === "chatgpt_draft_blocked") {
+        const name = `gateway-request-${msg.requestId.slice(0, 8)}.txt`;
+        const draftUrl = response.retryDraftUrl;
+        const reason = response.error;
+        const files = [
+          ...(draftUrl ? [] : attachments ?? []),
+          { name, mimeType: "text/plain", text: userMessage },
+        ];
+        let retry;
+        try {
+          retry = await send(
+            `Read ${name} as the original request for this turn. Use the conversation, tool definitions, and response format specified there. Reply to the latest message or tool result. If that request calls for gateway_request_id, use ${msg.requestId}.`,
+            files,
+            !draftUrl && newConversation,
+            draftUrl,
+          );
+        } catch (err) {
+          retry = { ok: false, error: err.message };
+        }
+        response = retry.ok ? retry : {
+          ...retry,
+          error: `${reason}. The attachment retry failed: ${retry.error ?? "ChatGPT changed conversations"}`,
+        };
       }
 
       sendToServer(socket, {
@@ -156,12 +200,12 @@ async function handleChatMessage(msg, socket) {
         ok: response.ok,
         content: response.content || "",
         error: response.error || "",
+        errorCode: response.errorCode,
         tabId: tab.id,
         url: response.url,
       });
       return; // Success — stop trying other tabs
     } catch (err) {
-      if (tab === preferred) throw err;
       errors.push(`Tab ${tab.id}: ${err.message}`);
     } finally {
       streamingRequests.delete(msg.requestId);

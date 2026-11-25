@@ -3,18 +3,19 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
-import { prepareChat } from "./chat-tools.mjs";
-import { conversationKey, conversationMessages, messageKey, newMessages } from "./chat-history.mjs";
+import { chatMessages, prepareChat } from "./chat-tools.mjs";
+import { conversationKey, describeHistory, messageKey, newMessages } from "./chat-history.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
 const MAX_BROWSER_WAIT = 240_000;
 // Allow a full browser turn plus time waiting for the shared tab.
 const DEFAULT_REQUEST_TIMEOUT = 300_000;
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_TRACKED_CHATS = 100;
 const API_KEY = process.env.CHATGPT_GATEWAY_API_KEY;
 const EXTENSION_ORIGIN = process.env.CHATGPT_GATEWAY_EXTENSION_ORIGIN;
 const extensionCapabilities = new WeakMap();
-const conversations = new WeakMap();
+const conversations = new Map();
 const metrics = {
   accepted: 0, completed: 0, failed: 0, cancelled: 0, timedOut: 0, browserReplies: 0,
   lastQueueWaitMs: null, lastBrowserReplyMs: null,
@@ -47,7 +48,7 @@ wss.on("connection", (ws) => {
       extensionCapabilities.set(ws, new Set(msg.capabilities));
     } else if (msg?.type === "response") {
       finishBrowserRequest(ws, msg.requestId, msg);
-    } else if (msg?.type === "progress" && activeRequest?.socket === ws &&
+    } else if (msg?.type === "progress" && activeRequest?.streamText && activeRequest.socket === ws &&
       activeRequest.requestId === msg.requestId && typeof msg.content === "string") {
       pending.get(msg.requestId)?.onProgress(msg.content);
     }
@@ -76,17 +77,33 @@ function dispatchNextRequest() {
   const [requestId, { socket, message, payload, queuedAt }] = pending.entries().next().value;
   if (socket.readyState !== WebSocket.OPEN) return; // The close handler releases its requests.
 
+  let prepared;
+  try {
+    prepared = prepareBrowserChat(payload, message, extensionCapabilities.get(socket));
+  } catch (err) {
+    resolveRequest(requestId, { ok: false, status: 400, error: err.message, errorCode: "invalid_request_error" });
+    queueMicrotask(dispatchNextRequest);
+    return;
+  }
+  if (prepared.attachmentsNeedSupport) {
+    resolveRequest(requestId, { ok: false, status: 503, error: "Reload the updated browser extension and refresh ChatGPT to enable image attachments" });
+    queueMicrotask(dispatchNextRequest);
+    return;
+  }
+
   const timer = setTimeout(() => {
     console.warn(`[gateway] Resetting stalled browser connection for ${requestId}`);
     socket.terminate();
   }, MAX_BROWSER_WAIT);
-  activeRequest = { socket, requestId, timer, startedAt: Date.now() };
-  const continuation = prepareContinuation(socket, payload, message);
-  // Once a prompt is sent, the recorded browser history may change even if the client cancels.
-  conversations.delete(socket);
+  const { chat, outgoing } = prepared;
+  activeRequest = {
+    socket, requestId, timer, chat, startedAt: Date.now(), streamText: outgoing.streamText,
+    continuedChat: conversationKey(outgoing.continuation?.url),
+  };
+  metrics.accepted++;
   metrics.lastQueueWaitMs = activeRequest.startedAt - queuedAt;
   console.log(`[gateway] Sent request ${requestId} to the browser extension`);
-  socket.send(JSON.stringify({ ...message, continuation }), (err) => {
+  socket.send(JSON.stringify(outgoing), (err) => {
     if (err) {
       finishBrowserRequest(socket, requestId, {
         ok: false,
@@ -96,29 +113,59 @@ function dispatchNextRequest() {
   });
 }
 
-function prepareContinuation(socket, payload, message) {
-  const previous = conversations.get(socket);
-  if (!previous || payload.new_conversation === true || previous.model !== message.model) return;
-  try {
-    const messages = newMessages(payload.messages ?? [], previous.keys);
-    if (!messages) return;
-    const chat = prepareChat({ ...payload, messages }, message.requestId, true);
-    return { tabId: previous.tabId, url: previous.url, messages: chat.messages, attachments: chat.attachments };
-  } catch {
-    // The full request is already validated and is safe to send on its own.
+function matchContinuation(payload, message) {
+  if (!conversations.size || payload.new_conversation === true) return;
+  const history = describeHistory(payload.messages);
+  const matches = [];
+  for (const previous of conversations.values()) {
+    if (previous.model !== message.model) continue;
+    const messages = newMessages(history, previous);
+    if (messages) matches.push({ previous, messages });
   }
+  matches.sort((left, right) => right.previous.keys.length - left.previous.keys.length);
+  const [match, alternative] = matches;
+  if (!match || match.previous.keys.length === alternative?.previous.keys.length) return;
+  return { ...match, clearInstructions: history.instructions.length === 0 && history.instructionsKey !== match.previous.instructionsKey };
 }
 
-function rememberConversation(socket, payload, model, result, { content, toolCalls }) {
-  if (!Number.isInteger(result.tabId) || !conversationKey(result.url)) {
-    conversations.delete(socket);
-    return;
+function prepareBrowserChat(payload, message, capabilities) {
+  const match = matchContinuation(payload, message);
+  let continuation;
+  let chat;
+  if (match) {
+    const { tabId, url, toolsKey } = match.previous;
+    chat = prepareChat({ ...payload, messages: match.messages }, message.requestId, {
+      toolsKey, clearInstructions: match.clearInstructions,
+    });
+    continuation = { tabId, url, messages: chat.messages, attachments: chat.attachments };
   }
+
+  // Older extensions still expect the fallback payload alongside a continuation.
+  const full = !continuation || !capabilities?.has("continuationOnly") ? prepareChat(payload, message.requestId) : null;
+  chat ??= full;
+  const outgoing = { ...message, continuation, streamText: payload.stream === true && chat.streamText };
+  if (full) {
+    outgoing.messages = full.messages;
+    outgoing.attachments = full.attachments;
+  }
+  return {
+    chat, outgoing,
+    attachmentsNeedSupport: (chat.attachments.length || full?.attachments.length) && !capabilities?.has("imageAttachments"),
+  };
+}
+
+function rememberConversation(payload, model, result, { content, toolCalls }, toolsKey) {
+  const key = conversationKey(result.url);
+  if (!Number.isInteger(result.tabId) || !key) return;
   const assistant = { role: "assistant", content, tool_calls: toolCalls };
-  conversations.set(socket, {
-    tabId: result.tabId, url: result.url, model,
-    keys: [...conversationMessages(payload.messages), assistant].map(messageKey),
+  const { keys, instructionsKey } = describeHistory(payload.messages);
+  conversations.delete(key);
+  conversations.set(key, {
+    tabId: result.tabId, url: result.url, model, instructionsKey, toolsKey,
+    keys: [...keys, messageKey(assistant)],
+    callIds: toolCalls?.map(({ id }) => id) ?? [],
   });
+  if (conversations.size > MAX_TRACKED_CHATS) conversations.delete(conversations.keys().next().value);
 }
 
 function releaseBrowser() {
@@ -128,12 +175,15 @@ function releaseBrowser() {
 
 function finishBrowserRequest(socket, requestId, result) {
   if (activeRequest?.socket !== socket || activeRequest.requestId !== requestId) return;
+  // A cancelled turn may have changed the browser history without reaching the IDE.
+  if (!pending.has(requestId)) conversations.delete(activeRequest.continuedChat);
   const elapsedMs = Date.now() - activeRequest.startedAt;
+  const chat = activeRequest.chat;
   metrics.browserReplies++;
   metrics.lastBrowserReplyMs = elapsedMs;
   console.log(`[gateway] Received browser reply for ${requestId} after ${elapsedMs} ms (ok=${result.ok})`);
   releaseBrowser();
-  resolveRequest(requestId, result);
+  resolveRequest(requestId, { ...result, chat });
   queueMicrotask(dispatchNextRequest);
 }
 
@@ -269,6 +319,7 @@ async function handleHttp(req, res) {
         extensionConnected: !!extensionWs,
         imageAttachments: extensionCapabilities.get(extensionWs)?.has("imageAttachments") ?? false,
         conversationReuse: extensionCapabilities.get(extensionWs)?.has("conversationReuse") ?? false,
+        longMessageFallback: extensionCapabilities.get(extensionWs)?.has("longMessageFallback") ?? false,
         pendingRequests: pending.size,
       })
     );
@@ -327,12 +378,10 @@ async function handleHttp(req, res) {
     }
 
     const requestId = randomUUID();
-    let chat;
     try {
-      chat = prepareChat(payload, requestId);
+      chatMessages(payload);
     } catch (err) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message: err.message, type: "invalid_request_error" } }));
+      errorResponse(res, 400, err.message, "invalid_request_error");
       return;
     }
 
@@ -347,11 +396,6 @@ async function handleHttp(req, res) {
       );
       return;
     }
-    if (chat.attachments.length && !extensionCapabilities.get(socket)?.has("imageAttachments")) {
-      errorResponse(res, 503, "Reload the updated browser extension and refresh ChatGPT to enable image attachments");
-      return;
-    }
-
     const timeoutMs = parseInt(payload.timeout || DEFAULT_REQUEST_TIMEOUT, 10);
     const completion = {
       id: `chatcmpl-${requestId}`,
@@ -362,16 +406,12 @@ async function handleHttp(req, res) {
       type: "chat",
       requestId,
       model: payload.model || "auto",
-      messages: chat.messages,
-      attachments: chat.attachments,
-      streamText: payload.stream === true && chat.streamText,
       newConversation: payload.new_conversation !== false,
     };
 
-    metrics.accepted++;
     let streamed = "";
     const onProgress = (content) => {
-      if (!message.streamText || res.destroyed || content === streamed || !content.startsWith(streamed)) return;
+      if (res.destroyed || content === streamed || !content.startsWith(streamed)) return;
       startEventStream(res);
       const delta = streamed ? {} : { role: "assistant" };
       delta.content = content.slice(streamed.length);
@@ -404,12 +444,17 @@ async function handleHttp(req, res) {
 
       if (res.destroyed) return;
 
+      if (result.status) {
+        errorResponse(res, result.status, result.error, result.errorCode);
+        return;
+      }
       if (!result.ok) {
         metrics.failed++;
-        errorResponse(res, 500, result.error);
+        errorResponse(res, result.errorCode === "chatgpt_input_too_long" ? 413 : 500, result.error);
         return;
       }
 
+      const { chat } = result;
       let decoded;
       try {
         decoded = chat.decode(result.content);
@@ -422,7 +467,7 @@ async function handleHttp(req, res) {
         errorResponse(res, 502, err.message, streamed ? "revised_response" : "invalid_tool_call");
         return;
       }
-      rememberConversation(socket, payload, message.model, result, decoded);
+      rememberConversation(payload, message.model, result, decoded, chat.toolsKey);
       sendCompletion(res, payload, completion, decoded, streamed);
       metrics.completed++;
     } catch (err) {

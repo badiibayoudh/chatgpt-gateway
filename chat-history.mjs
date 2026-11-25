@@ -6,6 +6,10 @@ function ordered(value) {
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, ordered(value[key])]));
 }
 
+export function valueKey(value) {
+  return createHash("sha256").update(JSON.stringify(ordered(value))).digest("hex");
+}
+
 export function messageKey({ role, content, tool_calls, tool_call_id, name }) {
   if (Array.isArray(content) && content.every((part) => part?.type === "text")) {
     content = content.map((part) => part.text).join("\n");
@@ -18,26 +22,37 @@ export function messageKey({ role, content, tool_calls, tool_call_id, name }) {
     }
     return { id: call?.id, name: fn?.name, args };
   }) : undefined;
-  return createHash("sha256").update(JSON.stringify(ordered({
+  return valueKey({
     role, content: content ?? "", calls, tool_call_id, name,
-  }))).digest("hex");
+  });
 }
 
-export function conversationMessages(messages = []) {
-  return messages.filter(({ role }) => role !== "system" && role !== "developer");
+export function describeHistory(messages = []) {
+  const conversation = [];
+  const instructions = [];
+  for (const message of messages) {
+    const { role } = message;
+    (role === "system" || role === "developer" ? instructions : conversation).push(message);
+  }
+  return { conversation, instructions, keys: conversation.map(messageKey), instructionsKey: valueKey(instructions) };
 }
 
-export function newMessages(messages, previousKeys) {
-  const conversation = conversationMessages(messages);
-  if (conversation.length <= previousKeys.length ||
-    previousKeys.some((key, index) => messageKey(conversation[index]) !== key)) return null;
-  const suffix = conversation.slice(previousKeys.length);
+export function newMessages(history, previous) {
+  const { conversation, instructions, keys, instructionsKey } = history;
+  let anchor = -1;
+  if (keys.length > previous.keys.length && previous.keys.every((key, index) => keys[index] === key)) {
+    anchor = previous.keys.length - 1;
+  } else if (previous.callIds.length) {
+    // A gateway-issued call ID survives Cline's serialization and history compaction.
+    anchor = conversation.findLastIndex(({ role, tool_calls }) => role === "assistant" &&
+      Array.isArray(tool_calls) && tool_calls.length === previous.callIds.length &&
+      previous.callIds.every((id) => tool_calls.some((call) => call?.id === id)));
+  }
+  if (anchor === -1) return null;
+  const suffix = conversation.slice(anchor + 1);
   if (!suffix.some(({ role }) => role === "user" || role === "tool")) return null;
-  const instructions = messages.filter(({ role }) => role === "system" || role === "developer");
-  const previous = conversation[previousKeys.length - 1];
-  // Give tool results the IDs assigned by the gateway for the previous calls.
-  const toolCalls = previous?.tool_calls?.length && suffix[0].role === "tool" ? [previous] : [];
-  return [...instructions, ...toolCalls, ...suffix];
+  const priorCall = previous.callIds.length && suffix[0].role === "tool" ? [conversation[anchor]] : [];
+  return [...(instructionsKey === previous.instructionsKey ? [] : instructions), ...priorCall, ...suffix];
 }
 
 export function conversationKey(url) {

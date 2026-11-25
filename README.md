@@ -116,9 +116,11 @@ Reload Continue's config and select this model in **Agent** mode. Attach the Pyt
 
 ### Chat reuse
 
-The gateway reuses the same ChatGPT conversation when Cline or Continue extends the previous request's history and that chat is still open in the same tab. It sends the new messages and any tool results for that turn. A new task or a changed ChatGPT tab gets a fresh chat with the available history.
+The IDE can keep sending its usual OpenAI-compatible history. When the gateway recognizes a follow-up, it sends only the new turn, including any new tool results and screenshots, to the same ChatGPT chat. It resends instructions and tool definitions when they change. Cline tool-call IDs help the gateway recognize the task even when Cline compacts the earlier history.
 
-This works automatically with the updated extension. API callers can explicitly request a fresh chat with `new_conversation: true`, or use `false` to continue in an open ChatGPT chat even when the gateway cannot match the history.
+The gateway can reopen a matched chat in a browser tab. If ChatGPT rejects a follow-up as too long, the gateway retries the new turn as a text attachment in that chat. A new task or a history the gateway cannot match starts a fresh ChatGPT chat with the supplied context. The gateway keeps recent matches in memory until the server restarts.
+
+Restart the server, reload the unpacked extension, and refresh the ChatGPT tab after updating. API callers can explicitly request a fresh chat with `new_conversation: true`, or use `false` to continue in an open ChatGPT chat when there is no history match.
 
 ### Screenshot input
 
@@ -126,7 +128,7 @@ Restart the server, reload the unpacked extension, and refresh the ChatGPT tab a
 
 The gateway accepts Chat Completions `image_url` parts containing base64 data URLs, and MCP `image` parts with `mimeType` and base64 `data` in a tool result. It also recognizes a JSON-encoded MCP result in tool text. The extension uploads those images beside the prompt and the prompt references each attachment by filename.
 
-PNG, JPEG, WebP, and GIF are supported, with up to 8 MiB per image and 20 MiB across 8 images per turn. Send images inline as base64 data URLs.
+PNG, JPEG, WebP, and GIF are supported. Each browser turn can upload up to 8 images totaling 20 MiB, with a maximum of 8 MiB per image. When reusing a chat, the gateway uploads only the new screenshots. When replaying history in a fresh chat, it prioritizes the newest tool-result batch and keeps the text of earlier results whose images exceed the upload allowance. Send images inline as base64 data URLs.
 
 ### Local access
 
@@ -158,7 +160,7 @@ Response format matches the [OpenAI Chat Completions API](https://platform.opena
 example: http://localhost:18790/health
 
 ```json
-{"status": "ok", "extensionConnected": true, "imageAttachments": true, "conversationReuse": true, "pendingRequests": 0}
+{"status": "ok", "extensionConnected": true, "imageAttachments": true, "conversationReuse": true, "longMessageFallback": true, "pendingRequests": 0}
 ```
 
 ### `GET /metrics`
@@ -219,7 +221,7 @@ The `chatgpt_ask` tool supports progress notifications per the MCP spec — clie
 
 - **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
 - **Structured replies.** Function calls and Continue Apply output are buffered until the gateway can validate the complete response. Plain-text deltas follow the browser's rendered output.
-- **Context and upload limits.** ChatGPT determines how much text it can accept and retain. The gateway sends complete tool results and uses the existing ChatGPT conversation for matching follow-ups. HTTP request bodies have a separate 32 MiB transport limit. When older images exceed the upload allowance, their text remains in the transcript.
+- **Context and upload limits.** ChatGPT determines how much text it can accept and retain. When it rejects a message as too long, the updated extension retries once in a fresh chat with the full request as a text attachment. ChatGPT's file-upload and context limits apply to that retry. HTTP request bodies have a separate 32 MiB transport limit.
 - **Browser-based tool calling.** The gateway describes client tools to ChatGPT as text and validates its structured reply before returning a tool call. The IDE client handles tool execution and approval.
 - **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
 - **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.

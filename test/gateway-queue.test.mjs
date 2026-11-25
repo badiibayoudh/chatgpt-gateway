@@ -32,11 +32,15 @@ async function startGateway(t, apiKey = "") {
     });
   });
   const base = `http://127.0.0.1:${port}`;
-  const browser = new WebSocket(`ws://127.0.0.1:${port}/ws`);
-  t.after(() => browser.terminate());
-  await once(browser, "open");
   const sent = [];
-  browser.on("message", (message) => sent.push(JSON.parse(message)));
+  async function connectBrowser() {
+    const connection = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    connection.on("message", (message) => sent.push(JSON.parse(message)));
+    await once(connection, "open");
+    return connection;
+  }
+  let browser = await connectBrowser();
+  t.after(() => browser.terminate());
   const send = (data) => browser.send(JSON.stringify(data));
   function request(path, options) { return fetch(base + path, options); }
   function complete(payload, options) {
@@ -50,6 +54,14 @@ async function startGateway(t, apiKey = "") {
 
   return {
     base, sent, send, request, complete,
+    async reconnectBrowser(capabilities) {
+      const closed = once(browser, "close");
+      browser.terminate();
+      await closed;
+      browser = await connectBrowser();
+      send({ type: "hello", capabilities });
+      await waitFor(async () => (await (await request("/health")).json()).conversationReuse);
+    },
     chat(text, { signal, timeout = 5000 } = {}) {
       return complete({ messages: [{ role: "user", content: text }], timeout }, { signal });
     },
@@ -88,6 +100,18 @@ test("gives overlapping IDE requests separate browser turns", { timeout: 10000 }
 
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=";
 
+test("reports ChatGPT’s input-size rejection to the client", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  const request = gateway.chat("Oversized message");
+  await waitFor(() => gateway.sent.length === 1);
+  gateway.reply(0, "", {
+    ok: false, errorCode: "chatgpt_input_too_long", error: "ChatGPT rejected the submission as too long",
+  });
+  const response = await request;
+  assert.equal(response.status, 413);
+  assert.match((await response.json()).error, /ChatGPT rejected/);
+});
+
 test("reuses the browser conversation for matching history and starts fresh for a new task", { timeout: 10000 }, async (t) => {
   const gateway = await startGateway(t);
   const user = { role: "user", content: "Start the task\n" + "a".repeat(250_000) };
@@ -119,6 +143,75 @@ test("reuses the browser conversation for matching history and starts fresh for 
   assert.equal(gateway.sent[2].newConversation, true);
   gateway.reply(2, "Fresh reply");
   await assertReply(fresh, "Fresh reply");
+});
+
+test("resumes a compacted Cline task and prepares only the new screenshot and tool result", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  const capabilities = ["conversationReuse", "continuationOnly", "imageAttachments"];
+  gateway.send({ type: "hello", capabilities });
+  await waitFor(async () => (await (await gateway.request("/health")).json()).conversationReuse);
+  const firstChat = { tabId: 7, url: "https://chatgpt.com/c/first" };
+  const secondChat = { tabId: 7, url: "https://chatgpt.com/c/second" };
+  const system = { role: "system", content: "System instructions supplied once" };
+  const user = { role: "user", content: "Original task" };
+  const tools = [{
+    type: "function",
+    function: { name: "read_file", description: "Original tool catalog", parameters: { type: "object" } },
+  }];
+  const first = gateway.complete({ messages: [system, user], tools });
+  await waitFor(() => gateway.sent.length === 1);
+  const { requestId } = gateway.sent[0];
+  gateway.reply(0, JSON.stringify({
+    gateway_request_id: requestId, tool_calls: [{ name: "read_file", arguments: { path: "fixture.txt" } }],
+  }), firstChat);
+  const response = await first;
+  assert.equal(response.status, 200);
+  const assistant = (await response.json()).choices[0].message;
+
+  const second = gateway.chat("Unrelated Cline task");
+  await waitFor(() => gateway.sent.length === 2);
+  assert.equal(gateway.sent[1].continuation, undefined);
+  assert.equal(gateway.sent[1].newConversation, true);
+  gateway.reply(1, "Second task reply", secondChat);
+  await assertReply(second, "Second task reply");
+  await gateway.reconnectBrowser(capabilities);
+
+  const result = { role: "tool", tool_call_id: assistant.tool_calls[0].id, content: "Latest file contents" };
+  const screenshot = { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] };
+  const history = { role: "user", content: [
+    { type: "text", text: "Older compacted history " + "z".repeat(250_000) },
+    { type: "image_url", image_url: { url: "https://example.invalid/historical-image.png" } },
+  ] };
+  const messages = [system, history, assistant, result, screenshot];
+  const resumed = gateway.complete({ messages, tools });
+  await waitFor(() => gateway.sent.length === 3);
+  const { continuation } = gateway.sent[2];
+  assert.equal(continuation.url, firstChat.url);
+  assert.equal(gateway.sent[2].messages, undefined);
+  const prompt = continuation.messages[0].content;
+  assert.match(prompt, /same client function definitions/);
+  assert.doesNotMatch(prompt, /System instructions supplied once|Original tool catalog|Older compacted history/);
+  const transcript = JSON.parse(prompt.split("Conversation (JSON):\n\n")[1]);
+  const name = `image-${gateway.sent[2].requestId.slice(0, 8)}-1.png`;
+  assert.deepEqual(transcript, [assistant, result, { role: "user", content: `[Attached image: ${name}]` }]);
+  assert.deepEqual(continuation.attachments, [{ name, mimeType: "image/png", data: png }]);
+  gateway.reply(2, "First task resumed", firstChat);
+  await assertReply(resumed, "First task resumed");
+
+  const updatedSystem = { role: "system", content: "Updated system instructions" };
+  const updatedTools = [{ ...tools[0], function: { ...tools[0].function, description: "Updated tool catalog" } }];
+  const next = gateway.complete({ tools: updatedTools, messages: [
+    updatedSystem, ...messages.slice(1), { role: "assistant", content: "First task resumed" },
+    { role: "user", content: "New question for the first task" },
+  ] });
+  await waitFor(() => gateway.sent.length === 4);
+  const updated = gateway.sent[3].continuation;
+  assert.equal(updated.url, firstChat.url);
+  assert.match(updated.messages[0].content, /Updated system instructions/);
+  assert.match(updated.messages[0].content, /Updated tool catalog/);
+  assert.deepEqual(updated.attachments, []);
+  gateway.reply(3, "Follow-up reply", firstChat);
+  await assertReply(next, "Follow-up reply");
 });
 
 test("round-trips a screenshot tool call, its MCP image result, and the final reply", { timeout: 10000 }, async (t) => {

@@ -5,6 +5,14 @@
 
   const POLL_INTERVAL = 750;
   const MAX_WAIT = 180_000; // 3 minutes
+  const LONG_DRAFT_LENGTH = 32_000;
+  const SEND_BUTTONS = [
+    '[data-testid="send-button"]',
+    'button[aria-label="Send prompt" i]',
+    'button[aria-label="Send" i]',
+    'button[aria-label="Senden" i]',
+    "#composer-submit-button",
+  ];
   const LEGACY_ASSISTANT = '[data-message-author-role="assistant"]';
   const ANSWER_BODY = '[data-markdown-text-style="assistant-message"], .markdown';
   const ASSISTANT_MESSAGE = [
@@ -30,6 +38,8 @@
     'form[data-chatgpt-composer] button[aria-label*="anhalten" i]',
     'form[data-chatgpt-composer] button[aria-label*="beenden" i]',
   ].join(", ");
+  const INPUT_TOO_LONG = /(?:die nachricht ist|deine (?:gesendete nachricht war|gesendeten nachrichten waren)) zu lang|(?:the |this |your )?(?:submitted )?messages? (?:you (?:submitted|sent) )?(?:was|were|is|are) too long/i;
+  const RETRY_LABEL = /^(?:retry|try again|erneut versuchen)$/i;
 
   // ── Helpers ──────────────────────────────────────────────
 
@@ -81,17 +91,10 @@
   }
 
   function findSendButton() {
-    const selectors = [
-      '[data-testid="send-button"]',
-      "#composer-submit-button",
-      'button[aria-label="Send prompt"]',
-      'button[aria-label*="Send"]',
-    ];
-    for (const sel of selectors) {
-      const btn = document.querySelector(sel);
-      if (btn && !btn.disabled) return btn;
+    for (const selector of SEND_BUTTONS) {
+      const button = document.querySelector(selector);
+      if (button && !button.disabled && button.getAttribute("aria-disabled") !== "true") return button;
     }
-    return null;
   }
 
   function findAssistantMessages() {
@@ -129,6 +132,27 @@
     return Array.from(document.querySelectorAll(STOP_GENERATION)).some(
       (button) => button.getClientRects().length > 0
     );
+  }
+
+  function oversizedNotices() {
+    const notices = new Set();
+    for (const alert of document.querySelectorAll('[role="alert"], [data-testid*="error"]')) {
+      if (INPUT_TOO_LONG.test(alert.textContent) && alert.getClientRects().length) notices.add(alert);
+    }
+    // The inline error can be a plain container with a retry button.
+    for (const button of document.querySelectorAll('main button, main [role="button"]')) {
+      if (!RETRY_LABEL.test(button.textContent.trim()) || !button.getClientRects().length ||
+        button.closest('[data-message-author-role], .markdown')) continue;
+      let container = button.parentElement;
+      for (let depth = 0; container && container.tagName !== "MAIN" && depth < 3; depth++) {
+        if (INPUT_TOO_LONG.test(container.textContent)) {
+          notices.add(container);
+          break;
+        }
+        container = container.parentElement;
+      }
+    }
+    return notices;
   }
 
   // ── Actions ──────────────────────────────────────────────
@@ -249,18 +273,33 @@
     }
   }
 
-  async function attachImages(attachments) {
-    if (!attachments?.length) return;
-    const composer = (await waitForInput()).closest("form");
-    if (!composer) throw new Error("Cannot find the ChatGPT attachment composer");
-    const tiles = () => composer.querySelectorAll(
-      'div[class*="file-tile"], [data-testid*="attachment"], img[src^="blob:"], img[src*="estuary/content"], img[src*="oaiusercontent.com"]'
+  function attachmentCounts(composer, name) {
+    const matchesName = (label) => {
+      const filename = label?.trim().replace(/^remove (?:file |image )?| entfernen$/gi, "");
+      return filename === name || filename?.replace(/ ?\(\d+\)(?=\.[^.\s]+$)/, "") === name;
+    };
+    const namedPreviews = [...document.querySelectorAll('button, [role="button"], img[alt]')].filter((element) =>
+      [element.getAttribute("aria-label"), element.getAttribute("title"), element.getAttribute("alt"), element.textContent]
+        .some(matchesName) && element.getClientRects().length > 0
     );
+    const composerPreviews = [...(composer?.querySelectorAll(
+      'div[class*="file-tile"], [data-testid*="attachment"], img[src^="blob:"], img[src^="data:image/"], img[src*="estuary/content"], img[src*="oaiusercontent.com"]'
+    ) ?? [])].filter((element) => element.getClientRects().length > 0 &&
+      (element.tagName !== "IMG" || (element.complete && element.naturalWidth > 0))
+    );
+    return { named: namedPreviews.length, composer: composerPreviews.length };
+  }
+
+  async function attachFiles(attachments) {
+    if (!attachments?.length) return;
+    await waitForInput();
+    const composer = () => (document.querySelector("#prompt-textarea") || findInput())?.closest("form");
+    if (!composer()) throw new Error("Cannot find the ChatGPT attachment composer");
     const uploadDeadline = Date.now() + 45_000;
-    for (const image of attachments) {
-      const previous = tiles().length;
+    for (const attachment of attachments) {
+      const previous = attachmentCounts(composer(), attachment.name);
       const fileInput = () => document.querySelector('#upload-files[type="file"]') ||
-        composer.querySelector('input[type="file"]');
+        composer()?.querySelector('input[type="file"]');
       if (!fileInput()) {
         const plus = document.querySelector('[data-testid="composer-plus-btn"]');
         if (!plus) throw new Error("Cannot open the ChatGPT attachment menu");
@@ -273,43 +312,80 @@
       }
       if (!picker) throw new Error("Cannot find the ChatGPT file input");
 
-      const bytes = Uint8Array.from(atob(image.data), (character) => character.charCodeAt(0));
+      const data = typeof attachment.text === "string"
+        ? attachment.text
+        : Uint8Array.from(atob(attachment.data), (character) => character.charCodeAt(0));
       const transfer = new DataTransfer();
-      transfer.items.add(new File([bytes], image.name, { type: image.mimeType }));
+      transfer.items.add(new File([data], attachment.name, { type: attachment.mimeType }));
       picker.files = transfer.files;
       picker.dispatchEvent(new Event("input", { bubbles: true }));
       picker.dispatchEvent(new Event("change", { bubbles: true }));
 
       const deadline = Math.min(Date.now() + 20_000, uploadDeadline);
+      let confirmed = false;
       while (Date.now() < deadline) {
         await sleep(250);
-        if (tiles().length > previous && findSendButton() &&
-          !composer.querySelector('[role="progressbar"], [class*="spinner"]')) break;
+        if (!findSendButton()) continue;
+        const current = attachmentCounts(composer(), attachment.name);
+        if (current.named > previous.named || current.composer > previous.composer) {
+          confirmed = true;
+          break;
+        }
       }
-      if (Date.now() >= deadline) throw new Error(`ChatGPT did not confirm upload of ${image.name}`);
+      if (!confirmed) throw new Error(`ChatGPT did not confirm upload of ${attachment.name}`);
     }
   }
 
-  async function clickSend() {
+  function isOversizedDraft() {
+    for (const button of document.querySelectorAll(SEND_BUTTONS.join(", "))) {
+      if ([button.getAttribute("title"), button.getAttribute("aria-label")].some((text) => INPUT_TOO_LONG.test(text))) return true;
+      const descriptions = button.getAttribute("aria-describedby")?.split(/\s+/) ?? [];
+      if (descriptions.some((id) => INPUT_TOO_LONG.test(document.getElementById(id)?.textContent))) return true;
+    }
+    return [...document.querySelectorAll('[role="tooltip"], [role="alert"]')].some(
+      (notice) => notice.getClientRects().length > 0 && INPUT_TOO_LONG.test(notice.textContent.replace(/\s+/g, " "))
+    );
+  }
+
+  function blockedDraft(code, message) {
+    const error = new Error(message);
+    error.code = code;
+    error.retryDraft = true;
+    return error;
+  }
+
+  async function clickSend(text) {
     // Wait a moment for the send button to become enabled
     for (let i = 0; i < 10; i++) {
       const btn = findSendButton();
-      if (btn && !btn.disabled) {
+      if (btn) {
         btn.click();
         return;
       }
+      if (isOversizedDraft()) {
+        throw blockedDraft("chatgpt_input_too_long", "ChatGPT disabled Send because the draft is too long");
+      }
       await sleep(300);
+    }
+    // ChatGPT can hide the reason until the user hovers over the disabled Send button.
+    if (text.length >= LONG_DRAFT_LENGTH) {
+      throw blockedDraft("chatgpt_draft_blocked", "ChatGPT kept Send disabled for the long draft");
     }
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(previousTurns, onProgress) {
+  async function waitForNewResponse(previousTurns, previousNotices, onProgress) {
     const deadline = Date.now() + MAX_WAIT;
     let lastTurnId = null;
     let lastText = "";
     let stableCount = 0;
 
     while (Date.now() < deadline) {
+      if (!lastText && [...oversizedNotices()].some((notice) => !previousNotices.has(notice))) {
+        const error = new Error("ChatGPT rejected the submission because its messages were too long");
+        error.code = "chatgpt_input_too_long";
+        throw error;
+      }
       const messages = findAssistantMessages();
       const message = messages[messages.length - 1];
       if (message) {
@@ -340,23 +416,33 @@
   // ── Message handler ──────────────────────────────────────
 
   async function handleChatRequest(msg) {
+    let draftUrl;
     try {
-      const expected = msg.expectedConversation?.split(/[?#]/)[0];
-      const conversationChanged = () => expected && window.location.href.split(/[?#]/)[0] !== expected;
-      if (conversationChanged()) return { ok: false, conversationChanged: true };
+      const chatUrl = (url) => url?.split(/[?#]/)[0].replace(/\/$/, "");
+      const expected = chatUrl(msg.expectedConversation);
+      const expectedDraft = chatUrl(msg.expectedDraftUrl);
+      const conversationChanged = () => expected && chatUrl(window.location.href) !== expected;
+      const draftChanged = () => expectedDraft && chatUrl(window.location.href) !== expectedDraft;
+      if (conversationChanged() || draftChanged()) return { ok: false, conversationChanged: true };
       // Start new conversation if requested
       if (msg.newConversation !== false) {
         await startNewChat();
         await selectModel(msg.model);
       }
 
+      if (msg.attachments?.length) {
+        // Keep Send's upload readiness separate from the length of the final draft.
+        await typeMessage("Preparing gateway attachments");
+        await attachFiles(msg.attachments);
+      }
       await typeMessage(msg.userMessage);
-      await attachImages(msg.attachments);
-      if (conversationChanged()) return { ok: false, conversationChanged: true };
+      if (conversationChanged() || draftChanged()) return { ok: false, conversationChanged: true };
       const previousTurns = new Set(
         Array.from(findAssistantMessages(), (message) => getTurnId(getAssistantTurn(message)))
       );
-      await clickSend();
+      const previousNotices = oversizedNotices();
+      draftUrl = window.location.href;
+      await clickSend(msg.userMessage);
 
       let streamed = "";
       const onProgress = msg.streamText ? (content) => {
@@ -364,12 +450,13 @@
         streamed = content;
         chrome.runtime.sendMessage({ type: "chat-progress", requestId: msg.requestId, content }).catch(() => {});
       } : undefined;
-      const response = await waitForNewResponse(previousTurns, onProgress);
+      const response = await waitForNewResponse(previousTurns, previousNotices, onProgress);
 
       if (conversationChanged()) throw new Error("ChatGPT conversation changed after submitting the prompt");
       return { ok: true, content: response, url: window.location.href };
     } catch (err) {
-      return { ok: false, error: err.message };
+      const retryDraftUrl = err.retryDraft && window.location.href === draftUrl ? draftUrl : undefined;
+      return { ok: false, error: err.message, errorCode: err.code, retryDraftUrl };
     }
   }
 

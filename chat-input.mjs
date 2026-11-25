@@ -76,11 +76,18 @@ export function normalizeMessages(messages, imagePrefix = "image") {
 export function assembleTranscript(entries) {
   // Image uploads have a separate limit. Keep older text even when its images age out.
   let latestTurn = 0;
-  let previousRole;
-  for (const [index, { message: { role } }] of entries.entries()) {
-    if (role === "system" || role === "developer") continue;
-    if (role === "user" && previousRole !== "tool") latestTurn = index;
-    previousRole = role;
+  let toolBatch = false;
+  for (const [index, { message: { role, content }, attachments }] of entries.entries()) {
+    if (role === "assistant") toolBatch = false;
+    if (role === "tool") {
+      if (!toolBatch) latestTurn = index;
+      toolBatch = true;
+    }
+    // Cline sends tool screenshots in separate image-only user messages.
+    if (role === "user" && !(toolBatch && attachments.length && !content?.trim())) {
+      latestTurn = index;
+      toolBatch = false;
+    }
   }
   const required = ({ message }, index) => index >= latestTurn ||
     message.role === "system" || message.role === "developer";

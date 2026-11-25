@@ -6,9 +6,10 @@ import { runInNewContext } from "node:vm";
 const script = await readFile(new URL("../background.js", import.meta.url), "utf8");
 const target = { id: 7, url: "https://chatgpt.com/c/fixture" };
 
-async function relay(tabs, changed = false) {
+async function relay(tabs, { changed = false, tooLong = false, retryError, draftUrl, useContinuation = true } = {}) {
   let socket;
   const prompts = [];
+  const reopened = [];
   const replies = [];
   class WebSocket {
     static OPEN = 1;
@@ -25,9 +26,20 @@ async function relay(tabs, changed = false) {
       runtime: { onMessage: event, onStartup: event, onInstalled: event },
       tabs: {
         query: async () => tabs,
+        create: async ({ url, active }) => {
+          reopened.push({ url, active });
+          return { id: 42, url };
+        },
         sendMessage: async (id, message) => {
+          if (message.type === "ping") return { ok: true, url: target.url };
           prompts.push({ id, message });
           if (changed && message.expectedConversation) return { ok: false, conversationChanged: true };
+          if (draftUrl && prompts.length === 1) {
+            return { ok: false, errorCode: "chatgpt_draft_blocked", error: "Send stayed disabled", retryDraftUrl: draftUrl };
+          }
+          if (tooLong && (prompts.length === 1 || retryError)) {
+            return { ok: false, errorCode: "chatgpt_input_too_long", error: retryError ?? "Messages were too long" };
+          }
           return { ok: true, content: "Reply", url: target.url };
         },
       },
@@ -37,14 +49,15 @@ async function relay(tabs, changed = false) {
     type: "chat",
     requestId: "request",
     messages: [{ role: "user", content: "Full transcript" }],
-    continuation: {
+    attachments: [{ name: "image-1.png", mimeType: "image/png", data: "fixture" }],
+    continuation: useContinuation ? {
       tabId: target.id,
       url: target.url,
       messages: [{ role: "user", content: "New turn only" }],
-      attachments: [],
-    },
+      attachments: [{ name: "new-screenshot.png", mimeType: "image/png", data: "new" }],
+    } : undefined,
   }) });
-  return { prompts, replies };
+  return { prompts, replies, reopened };
 }
 
 test("sends only the new turn to the matching tab even when another tab is listed first", async () => {
@@ -56,9 +69,54 @@ test("sends only the new turn to the matching tab even when another tab is liste
   assert.equal(replies[0].url, target.url);
 });
 
-test("uses the full transcript when the selected tab has changed conversations", async () => {
-  const { prompts } = await relay([target], true);
+test("reopens the same chat when the tab has moved to a different conversation", async () => {
+  const { prompts, reopened } = await relay([{ ...target, url: "https://chatgpt.com/c/different" }]);
+  assert.deepEqual(reopened, [{ url: target.url, active: false }]);
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0].id, 42);
+  assert.equal(prompts[0].message.userMessage, "New turn only");
+  assert.equal(prompts[0].message.expectedConversation, target.url);
+  assert.equal(prompts[0].message.newConversation, false);
+});
+
+test("does not send the full transcript if the user navigates during a continuation", async () => {
+  const { prompts, replies } = await relay([target], { changed: true });
+  assert.equal(prompts.length, 1);
+  assert.equal(replies[0].ok, false);
+  assert.match(replies[0].error, /navigated away/);
+});
+
+test("attaches only the oversized new turn and its images in the same chat", async () => {
+  const { prompts, replies } = await relay([target], { tooLong: true });
   assert.equal(prompts.length, 2);
-  assert.equal(prompts[1].message.userMessage, "Full transcript");
-  assert.equal(prompts[1].message.newConversation, true);
+  assert.equal(prompts[0].message.userMessage, "New turn only");
+  const { message } = prompts[1];
+  assert.equal(message.newConversation, false);
+  assert.equal(message.expectedConversation, target.url);
+  assert.match(message.userMessage, /gateway-request-request\.txt/);
+  assert.equal(message.attachments[0].name, "new-screenshot.png");
+  assert.deepEqual(JSON.parse(JSON.stringify(message.attachments[1])), {
+    name: "gateway-request-request.txt", mimeType: "text/plain", text: "New turn only",
+  });
+  assert.equal(replies[0].ok, true);
+});
+
+test("returns the rejection when ChatGPT also rejects the attachment retry", async () => {
+  const { prompts, replies } = await relay([target], { tooLong: true, retryError: "still too long" });
+  assert.equal(prompts.length, 2);
+  assert.equal(replies[0].errorCode, "chatgpt_input_too_long");
+  assert.match(replies[0].error, /attachment retry failed: still too long/);
+});
+
+test("retries a blocked draft in place and keeps its staged screenshots", async () => {
+  const home = { id: 1, url: "https://chatgpt.com/" };
+  const { prompts, replies } = await relay([home], { draftUrl: home.url, useContinuation: false });
+  assert.equal(prompts.length, 2);
+  assert.equal(prompts[0].message.newConversation, true);
+  const { message } = prompts[1];
+  assert.equal(message.newConversation, false);
+  assert.equal(message.expectedDraftUrl, home.url);
+  assert.equal(message.attachments.length, 1);
+  assert.equal(message.attachments[0].text, "Full transcript");
+  assert.equal(replies[0].ok, true);
 });
