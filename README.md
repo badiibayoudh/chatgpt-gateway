@@ -129,7 +129,7 @@ OpenAI-compatible chat completions endpoint.
 | `tool_choice` | string or object | `"auto"` | `auto`, `none`, `required`, or a named function object |
 | `parallel_tool_calls` | boolean | `true` | Set to `false` to allow at most one function call per reply |
 | `new_conversation` | boolean | `true` | Start a fresh chat for each request |
-| `timeout` | number | `90000` | Max wait time in ms, including time in the browser queue |
+| `timeout` | number | `300000` | Max wait time in ms, including time in the browser queue |
 
 Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 

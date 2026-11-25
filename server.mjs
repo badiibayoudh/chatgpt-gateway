@@ -7,6 +7,8 @@ import { prepareChat } from "./chat-tools.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
 const MAX_BROWSER_WAIT = 240_000;
+// Allow a full browser turn plus time waiting for the shared tab.
+const DEFAULT_REQUEST_TIMEOUT = 300_000;
 
 // Pending HTTP requests waiting for extension response
 const pending = new Map();
@@ -60,7 +62,7 @@ function dispatchNextRequest() {
     console.warn(`[gateway] Resetting stalled browser connection for ${requestId}`);
     socket.terminate();
   }, MAX_BROWSER_WAIT);
-  activeRequest = { socket, requestId, timer };
+  activeRequest = { socket, requestId, timer, startedAt: Date.now() };
   console.log(`[gateway] Sent request ${requestId} to the browser extension`);
   socket.send(JSON.stringify(message), (err) => {
     if (err) {
@@ -79,7 +81,8 @@ function releaseBrowser() {
 
 function finishBrowserRequest(socket, requestId, result) {
   if (activeRequest?.socket !== socket || activeRequest.requestId !== requestId) return;
-  console.log(`[gateway] Received browser reply for ${requestId} (ok=${result.ok})`);
+  const elapsedMs = Date.now() - activeRequest.startedAt;
+  console.log(`[gateway] Received browser reply for ${requestId} after ${elapsedMs} ms (ok=${result.ok})`);
   releaseBrowser();
   resolveRequest(requestId, result);
   dispatchNextRequest();
@@ -228,7 +231,7 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const timeoutMs = parseInt(payload.timeout || "90000", 10);
+    const timeoutMs = parseInt(payload.timeout || DEFAULT_REQUEST_TIMEOUT, 10);
     const message = {
       type: "chat",
       requestId,
