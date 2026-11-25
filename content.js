@@ -249,6 +249,47 @@
     }
   }
 
+  async function attachImages(attachments) {
+    if (!attachments?.length) return;
+    const composer = (await waitForInput()).closest("form");
+    if (!composer) throw new Error("Cannot find the ChatGPT attachment composer");
+    const tiles = () => composer.querySelectorAll(
+      'div[class*="file-tile"], [data-testid*="attachment"], img[src^="blob:"], img[src*="estuary/content"], img[src*="oaiusercontent.com"]'
+    );
+    const uploadDeadline = Date.now() + 45_000;
+    for (const image of attachments) {
+      const previous = tiles().length;
+      const fileInput = () => document.querySelector('#upload-files[type="file"]') ||
+        composer.querySelector('input[type="file"]');
+      if (!fileInput()) {
+        const plus = document.querySelector('[data-testid="composer-plus-btn"]');
+        if (!plus) throw new Error("Cannot open the ChatGPT attachment menu");
+        plus.click();
+      }
+      let picker = fileInput();
+      for (let attempts = 0; !picker && attempts < 20; attempts++) {
+        await sleep(100);
+        picker = fileInput();
+      }
+      if (!picker) throw new Error("Cannot find the ChatGPT file input");
+
+      const bytes = Uint8Array.from(atob(image.data), (character) => character.charCodeAt(0));
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([bytes], image.name, { type: image.mimeType }));
+      picker.files = transfer.files;
+      picker.dispatchEvent(new Event("input", { bubbles: true }));
+      picker.dispatchEvent(new Event("change", { bubbles: true }));
+
+      const deadline = Math.min(Date.now() + 20_000, uploadDeadline);
+      while (Date.now() < deadline) {
+        await sleep(250);
+        if (tiles().length > previous && findSendButton() &&
+          !composer.querySelector('[role="progressbar"], [class*="spinner"]')) break;
+      }
+      if (Date.now() >= deadline) throw new Error(`ChatGPT did not confirm upload of ${image.name}`);
+    }
+  }
+
   async function clickSend() {
     // Wait a moment for the send button to become enabled
     for (let i = 0; i < 10; i++) {
@@ -262,7 +303,7 @@
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(previousTurns) {
+  async function waitForNewResponse(previousTurns, onProgress) {
     const deadline = Date.now() + MAX_WAIT;
     let lastTurnId = null;
     let lastText = "";
@@ -277,6 +318,9 @@
         if (!previousTurns.has(turnId)) {
           const text = getAssistantText(message);
           const generating = isGenerating();
+          if (onProgress && generating && lastText && turnId === lastTurnId && text.startsWith(lastText)) {
+            onProgress(lastText);
+          }
           stableCount = !generating && text === lastText && turnId === lastTurnId ? stableCount + 1 : 0;
           lastTurnId = turnId;
           lastText = text;
@@ -297,6 +341,9 @@
 
   async function handleChatRequest(msg) {
     try {
+      const expected = msg.expectedConversation?.split(/[?#]/)[0];
+      const conversationChanged = () => expected && window.location.href.split(/[?#]/)[0] !== expected;
+      if (conversationChanged()) return { ok: false, conversationChanged: true };
       // Start new conversation if requested
       if (msg.newConversation !== false) {
         await startNewChat();
@@ -304,14 +351,23 @@
       }
 
       await typeMessage(msg.userMessage);
+      await attachImages(msg.attachments);
+      if (conversationChanged()) return { ok: false, conversationChanged: true };
       const previousTurns = new Set(
         Array.from(findAssistantMessages(), (message) => getTurnId(getAssistantTurn(message)))
       );
       await clickSend();
 
-      const response = await waitForNewResponse(previousTurns);
+      let streamed = "";
+      const onProgress = msg.streamText ? (content) => {
+        if (conversationChanged() || content === streamed || !content.startsWith(streamed)) return;
+        streamed = content;
+        chrome.runtime.sendMessage({ type: "chat-progress", requestId: msg.requestId, content }).catch(() => {});
+      } : undefined;
+      const response = await waitForNewResponse(previousTurns, onProgress);
 
-      return { ok: true, content: response };
+      if (conversationChanged()) throw new Error("ChatGPT conversation changed after submitting the prompt");
+      return { ok: true, content: response, url: window.location.href };
     } catch (err) {
       return { ok: false, error: err.message };
     }

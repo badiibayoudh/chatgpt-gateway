@@ -6,6 +6,7 @@ const GATEWAY_URL = "ws://localhost:18790/ws";
 const HEARTBEAT_INTERVAL = 20_000;
 let ws = null;
 let reconnectTimer = null;
+const streamingRequests = new Map();
 
 function log(...args) {
   console.log("[Gateway BG]", ...args);
@@ -26,6 +27,7 @@ function connect() {
 
   socket.onopen = () => {
     log("Connected to gateway server");
+    sendToServer(socket, { type: "hello", capabilities: ["imageAttachments", "conversationReuse"] });
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
@@ -86,6 +88,16 @@ function sendToServer(socket, data) {
   }
 }
 
+function userText(messages = []) {
+  const content = [...messages].reverse().find(({ role }) => role === "user")?.content;
+  return Array.isArray(content)
+    ? content
+        .filter((part) => part?.type === "text" && typeof part.text === "string")
+        .map((part) => part.text)
+        .join("\n")
+    : content;
+}
+
 async function handleChatMessage(msg, socket) {
   // Find a ChatGPT tab
   const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
@@ -100,16 +112,7 @@ async function handleChatMessage(msg, socket) {
     return;
   }
 
-  // Extract the last user message
-  const messages = msg.messages || [];
-  const lastUser = [...messages].reverse().find((m) => m.role === "user");
-  const content = lastUser?.content;
-  const userMessage = Array.isArray(content)
-    ? content
-        .filter((part) => part?.type === "text" && typeof part.text === "string")
-        .map((part) => part.text)
-        .join("\n")
-    : content;
+  const userMessage = userText(msg.messages);
 
   if (typeof userMessage !== "string" || !userMessage) {
     sendToServer(socket, {
@@ -121,16 +124,31 @@ async function handleChatMessage(msg, socket) {
     return;
   }
 
-  // Try each tab until one responds (handles multiple ChatGPT tabs)
+  const continuation = msg.continuation;
+  const preferred = continuation && tabs.find((tab) => tab.id === continuation.tabId &&
+    tab.url?.split(/[?#]/)[0] === continuation.url.split(/[?#]/)[0]);
+  const candidates = preferred ? [preferred, ...tabs.filter((tab) => tab !== preferred)] : tabs;
   const errors = [];
-  for (const tab of tabs) {
+  for (const tab of candidates) {
     try {
-      const response = await chrome.tabs.sendMessage(tab.id, {
+      if (msg.streamText) streamingRequests.set(msg.requestId, { socket, tabId: tab.id });
+      const send = (text, attachments, newConversation, expectedConversation) => chrome.tabs.sendMessage(tab.id, {
         type: "chat",
+        requestId: msg.requestId,
         model: msg.model,
-        userMessage,
-        newConversation: msg.newConversation !== false,
+        userMessage: text,
+        attachments,
+        streamText: msg.streamText,
+        newConversation,
+        expectedConversation,
       });
+      let response;
+      if (tab === preferred) {
+        response = await send(userText(continuation.messages), continuation.attachments, false, continuation.url);
+      }
+      if (!response || response.conversationChanged) {
+        response = await send(userMessage, msg.attachments, msg.newConversation !== false);
+      }
 
       sendToServer(socket, {
         type: "response",
@@ -138,10 +156,15 @@ async function handleChatMessage(msg, socket) {
         ok: response.ok,
         content: response.content || "",
         error: response.error || "",
+        tabId: tab.id,
+        url: response.url,
       });
       return; // Success — stop trying other tabs
     } catch (err) {
+      if (tab === preferred) throw err;
       errors.push(`Tab ${tab.id}: ${err.message}`);
+    } finally {
+      streamingRequests.delete(msg.requestId);
     }
   }
 
@@ -153,6 +176,14 @@ async function handleChatMessage(msg, socket) {
     error: `No ChatGPT tab responded (${tabs.length} tab(s) tried). Refresh chatgpt.com.\n${errors.join("\n")}`,
   });
 }
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (msg.type !== "chat-progress") return;
+  const request = streamingRequests.get(msg.requestId);
+  if (request && sender.tab?.id === request.tabId && sender.frameId === 0) {
+    sendToServer(request.socket, { type: "progress", requestId: msg.requestId, content: msg.content });
+  }
+});
 
 // Connect on startup
 connect();

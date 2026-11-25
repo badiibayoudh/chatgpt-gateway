@@ -19,6 +19,7 @@ const read = { type: "function", function: { name: "read_currently_open_file" } 
 const args = { filepath: "sample.py", changes: "def add(a, b):\n    return a + b" };
 const call = { name: edit.function.name, arguments: args };
 const user = { role: "user", content: "Fix the selected file" };
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=";
 
 function envelope(calls, id = requestId) {
   return JSON.stringify({ gateway_request_id: id, tool_calls: calls });
@@ -34,6 +35,60 @@ test("keeps plain chat and ordinary JSON replies as text", () => {
   assert.deepEqual(agent.decode(content), { content });
   const example = "Example:\n```json\n" + envelope([call]) + "\n```";
   assert.deepEqual(agent.decode(example), { content: example });
+});
+
+test("extracts OpenAI image content without putting base64 in the browser prompt", () => {
+  const messages = [{ role: "user", content: [
+    { type: "text", text: "Where are the tanks?" },
+    { type: "image_url", image_url: { url: "data:image/png;base64," + png } },
+  ] }];
+  const chat = prepareChat({ messages }, requestId);
+  assert.deepEqual(chat.attachments, [{ name: "image-1.png", mimeType: "image/png", data: png }]);
+  assert.match(chat.messages[0].content, /Attached image: image-1.png/);
+  assert.ok(!chat.messages[0].content.includes(png));
+  messages[0].content[1].image_url.url = "https://example.org/image.png";
+  assert.throws(() => prepareChat({ messages }, requestId), /base64 image data URL/);
+});
+
+test("keeps the full transcript across the former gateway context budget", () => {
+  const messages = [
+    { role: "system", content: "Keep instructions" },
+    { role: "user", content: "old".repeat(90_000) },
+    { role: "assistant", content: "Old reply" },
+    user,
+    { role: "assistant", tool_calls: [{ id: "active-call" }] },
+    { role: "tool", tool_call_id: "active-call", content: "Current result" },
+  ];
+  const chat = prepareChat({ messages }, requestId);
+  const prompt = chat.messages[0].content;
+  assert.ok(prompt.length > 240_000);
+  assert.deepEqual(JSON.parse(prompt.split("Conversation (JSON):\n\n")[1]), messages);
+});
+
+test("preserves large tool output, including its middle", () => {
+  const messages = [user, {
+    role: "tool",
+    tool_call_id: "large-result",
+    content: "start\r\n" + "x".repeat(40_000) + "\r\n    exact middle\r\n" + "y".repeat(40_000) + "\r\nend",
+  }];
+  const chat = prepareChat({ messages }, requestId);
+  const transcript = JSON.parse(chat.messages[0].content.split("Conversation (JSON):\n\n")[1]);
+  assert.equal(transcript.at(-1).content, messages[1].content);
+});
+
+test("retains earlier text when its image exceeds the attachment allowance", () => {
+  const messages = Array.from({ length: 9 }, (_value, index) => ({
+    role: "user", content: [
+      { type: "text", text: `Screenshot description ${index}` },
+      { type: "image", mimeType: "image/png", data: png },
+    ],
+  }));
+  const chat = prepareChat({ messages }, requestId);
+  assert.equal(chat.attachments.length, 8);
+  const transcript = JSON.parse(chat.messages[0].content.split("Conversation (JSON):\n\n")[1]);
+  assert.equal(transcript.length, 9);
+  assert.equal(transcript[0].content, "Screenshot description 0\n[Earlier image unavailable: image-1.png]");
+  assert.equal(transcript.at(-1).content, "Screenshot description 8\n[Attached image: image-9.png]");
 });
 
 test("passes the system prompt, selected source, prior function call and tool result", () => {

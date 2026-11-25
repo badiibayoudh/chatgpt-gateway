@@ -14,6 +14,7 @@ import {
 
 const GATEWAY_URL =
   process.env.CHATGPT_GATEWAY_URL || "http://localhost:18790";
+const API_KEY = process.env.CHATGPT_GATEWAY_API_KEY;
 const DEFAULT_TIMEOUT = parseInt(
   process.env.CHATGPT_GATEWAY_TIMEOUT || "90000",
   10
@@ -37,13 +38,16 @@ async function gatewayHealth() {
 async function gatewayChatCompletions(body, signal) {
   const res = await fetch(`${GATEWAY_URL}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
+    },
     body: JSON.stringify(body),
     signal,
   });
   const data = await res.json();
   if (!res.ok)
-    throw new Error(data.error || `Gateway returned ${res.status}`);
+    throw new Error(data.error?.message || data.error || `Gateway returned ${res.status}`);
   return data;
 }
 

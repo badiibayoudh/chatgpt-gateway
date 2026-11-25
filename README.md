@@ -28,7 +28,7 @@ Content script on chatgpt.com
 ChatGPT (your logged-in browser session)
 ```
 
-The extension's content script types your message into ChatGPT's input field, clicks send, waits for the response to finish streaming, extracts the text, and returns it through the chain. The gateway server sends the result as an OpenAI-compatible JSON response or as server-sent events when the client requests streaming.
+The extension's content script types the message, uploads any image attachments, and extracts ChatGPT's reply. The gateway returns OpenAI-compatible JSON or streams plain-text updates as server-sent events.
 
 ## Can I keep using my browser?
 
@@ -114,6 +114,26 @@ models:
 
 Reload Continue's config and select this model in **Agent** mode. Attach the Python file and ask Continue to edit it. If **Edit File** is set to **Ask First**, click **Continue** on the tool card and review the resulting diff. Continue runs the tool and sends its result back through the gateway.
 
+### Chat reuse
+
+The gateway reuses the same ChatGPT conversation when Cline or Continue extends the previous request's history and that chat is still open in the same tab. It sends the new messages and any tool results for that turn. A new task or a changed ChatGPT tab gets a fresh chat with the available history.
+
+This works automatically with the updated extension. API callers can explicitly request a fresh chat with `new_conversation: true`, or use `false` to continue in an open ChatGPT chat even when the gateway cannot match the history.
+
+### Screenshot input
+
+Restart the server, reload the unpacked extension, and refresh the ChatGPT tab after updating. Enable image input for the gateway model so the IDE forwards screenshots to the API. In Continue, set `capabilities: [tool_use, image_input]` for the model. In Cline, enable image support in the OpenAI-compatible model configuration.
+
+The gateway accepts Chat Completions `image_url` parts containing base64 data URLs, and MCP `image` parts with `mimeType` and base64 `data` in a tool result. It also recognizes a JSON-encoded MCP result in tool text. The extension uploads those images beside the prompt and the prompt references each attachment by filename.
+
+PNG, JPEG, WebP, and GIF are supported, with up to 8 MiB per image and 20 MiB across 8 images per turn. Send images inline as base64 data URLs.
+
+### Local access
+
+The server listens on `127.0.0.1` and `::1`. Set `CHATGPT_GATEWAY_API_KEY` on the server to require an `Authorization: Bearer ...` header for the API, including metrics. Use that key in Continue or Cline. Set the same environment variable for the bundled MCP wrapper when using it.
+
+The browser extension connects over a separate loopback WebSocket. Set `CHATGPT_GATEWAY_EXTENSION_ORIGIN` to its exact extension origin if you want to restrict which extension can connect.
+
 ## API
 
 ### `POST /v1/chat/completions`
@@ -124,20 +144,26 @@ OpenAI-compatible chat completions endpoint.
 |---|---|---|---|
 | `messages` | array | required | Array of `{role, content}` message objects |
 | `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
-| `stream` | boolean | `false` | Return server-sent events after the browser finishes generating |
+| `stream` | boolean | `false` | Stream plain-text deltas as the browser renders them |
 | `tools` | array | `[]` | Function definitions with draft-07 or 2020-12 JSON Schema parameters |
 | `tool_choice` | string or object | `"auto"` | `auto`, `none`, `required`, or a named function object |
 | `parallel_tool_calls` | boolean | `true` | Set to `false` to allow at most one function call per reply |
-| `new_conversation` | boolean | `true` | Start a fresh chat for each request |
+| `new_conversation` | boolean | automatic | Force a fresh chat with `true` or use an open chat with `false` |
 | `timeout` | number | `300000` | Max wait time in ms, including time in the browser queue |
 
 Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 
 ### `GET /health`
 
+example: http://localhost:18790/health
+
 ```json
-{"status": "ok", "extensionConnected": true}
+{"status": "ok", "extensionConnected": true, "imageAttachments": true, "conversationReuse": true, "pendingRequests": 0}
 ```
+
+### `GET /metrics`
+
+Returns request outcome counters, queue depth, browser busy status, and the most recent queue and browser times. Counters reset on restart.
 
 ## MCP Server
 
@@ -192,7 +218,8 @@ The `chatgpt_ask` tool supports progress notifications per the MCP spec — clie
 ## Limitations
 
 - **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
-- **Buffered replies.** Streaming clients receive the full text in one event after ChatGPT finishes generating.
+- **Structured replies.** Function calls and Continue Apply output are buffered until the gateway can validate the complete response. Plain-text deltas follow the browser's rendered output.
+- **Context and upload limits.** ChatGPT determines how much text it can accept and retain. The gateway sends complete tool results and uses the existing ChatGPT conversation for matching follow-ups. HTTP request bodies have a separate 32 MiB transport limit. When older images exceed the upload allowance, their text remains in the transcript.
 - **Browser-based tool calling.** The gateway describes client tools to ChatGPT as text and validates its structured reply before returning a tool call. The IDE client handles tool execution and approval.
 - **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
 - **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.

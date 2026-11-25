@@ -1,14 +1,24 @@
 // ChatGPT Gateway Server
 // HTTP API + WebSocket relay to Chrome extension
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { WebSocket, WebSocketServer } from "ws";
 import { prepareChat } from "./chat-tools.mjs";
+import { conversationKey, conversationMessages, messageKey, newMessages } from "./chat-history.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
 const MAX_BROWSER_WAIT = 240_000;
 // Allow a full browser turn plus time waiting for the shared tab.
 const DEFAULT_REQUEST_TIMEOUT = 300_000;
+const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const API_KEY = process.env.CHATGPT_GATEWAY_API_KEY;
+const EXTENSION_ORIGIN = process.env.CHATGPT_GATEWAY_EXTENSION_ORIGIN;
+const extensionCapabilities = new WeakMap();
+const conversations = new WeakMap();
+const metrics = {
+  accepted: 0, completed: 0, failed: 0, cancelled: 0, timedOut: 0, browserReplies: 0,
+  lastQueueWaitMs: null, lastBrowserReplyMs: null,
+};
 
 // Pending HTTP requests waiting for extension response
 const pending = new Map();
@@ -18,11 +28,12 @@ let activeRequest = null;
 
 // ── WebSocket server (extension connects here) ────────────
 
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY_BYTES });
 
 wss.on("connection", (ws) => {
   console.log("[gateway] Extension connected");
   extensionWs = ws;
+  ws.on("error", (err) => console.warn("[gateway] Extension socket error:", err.code ?? err.name));
 
   ws.on("message", (raw) => {
     let msg;
@@ -32,7 +43,14 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    if (msg.type === "response") finishBrowserRequest(ws, msg.requestId, msg);
+    if (msg?.type === "hello" && Array.isArray(msg.capabilities)) {
+      extensionCapabilities.set(ws, new Set(msg.capabilities));
+    } else if (msg?.type === "response") {
+      finishBrowserRequest(ws, msg.requestId, msg);
+    } else if (msg?.type === "progress" && activeRequest?.socket === ws &&
+      activeRequest.requestId === msg.requestId && typeof msg.content === "string") {
+      pending.get(msg.requestId)?.onProgress(msg.content);
+    }
   });
 
   ws.on("close", () => {
@@ -55,7 +73,7 @@ wss.on("connection", (ws) => {
 
 function dispatchNextRequest() {
   if (activeRequest || !pending.size) return;
-  const [requestId, { socket, message }] = pending.entries().next().value;
+  const [requestId, { socket, message, payload, queuedAt }] = pending.entries().next().value;
   if (socket.readyState !== WebSocket.OPEN) return; // The close handler releases its requests.
 
   const timer = setTimeout(() => {
@@ -63,14 +81,43 @@ function dispatchNextRequest() {
     socket.terminate();
   }, MAX_BROWSER_WAIT);
   activeRequest = { socket, requestId, timer, startedAt: Date.now() };
+  const continuation = prepareContinuation(socket, payload, message);
+  // Once a prompt is sent, the recorded browser history may change even if the client cancels.
+  conversations.delete(socket);
+  metrics.lastQueueWaitMs = activeRequest.startedAt - queuedAt;
   console.log(`[gateway] Sent request ${requestId} to the browser extension`);
-  socket.send(JSON.stringify(message), (err) => {
+  socket.send(JSON.stringify({ ...message, continuation }), (err) => {
     if (err) {
       finishBrowserRequest(socket, requestId, {
         ok: false,
         error: "Could not send request to the browser extension",
       });
     }
+  });
+}
+
+function prepareContinuation(socket, payload, message) {
+  const previous = conversations.get(socket);
+  if (!previous || payload.new_conversation === true || previous.model !== message.model) return;
+  try {
+    const messages = newMessages(payload.messages ?? [], previous.keys);
+    if (!messages) return;
+    const chat = prepareChat({ ...payload, messages }, message.requestId, true);
+    return { tabId: previous.tabId, url: previous.url, messages: chat.messages, attachments: chat.attachments };
+  } catch {
+    // The full request is already validated and is safe to send on its own.
+  }
+}
+
+function rememberConversation(socket, payload, model, result, { content, toolCalls }) {
+  if (!Number.isInteger(result.tabId) || !conversationKey(result.url)) {
+    conversations.delete(socket);
+    return;
+  }
+  const assistant = { role: "assistant", content, tool_calls: toolCalls };
+  conversations.set(socket, {
+    tabId: result.tabId, url: result.url, model,
+    keys: [...conversationMessages(payload.messages), assistant].map(messageKey),
   });
 }
 
@@ -82,10 +129,12 @@ function releaseBrowser() {
 function finishBrowserRequest(socket, requestId, result) {
   if (activeRequest?.socket !== socket || activeRequest.requestId !== requestId) return;
   const elapsedMs = Date.now() - activeRequest.startedAt;
+  metrics.browserReplies++;
+  metrics.lastBrowserReplyMs = elapsedMs;
   console.log(`[gateway] Received browser reply for ${requestId} after ${elapsedMs} ms (ok=${result.ok})`);
   releaseBrowser();
   resolveRequest(requestId, result);
-  dispatchNextRequest();
+  queueMicrotask(dispatchNextRequest);
 }
 
 function resolveRequest(requestId, result) {
@@ -101,16 +150,34 @@ function cleanupRequest(requestId) {
   if (entry) {
     clearTimeout(entry.timer);
     pending.delete(requestId);
+    metrics.cancelled++;
     entry.reject(new Error("Client disconnected"));
   }
 }
 
-function sendCompletion(res, payload, requestId, { content, toolCalls }) {
-  const completion = {
-    id: `chatcmpl-${requestId}`,
-    created: Math.floor(Date.now() / 1000),
-    model: payload.model || "chatgpt-web",
-  };
+function streamFrame(data) {
+  return `data: ${JSON.stringify(data)}\n\n`;
+}
+
+function startEventStream(res) {
+  if (res.headersSent) return;
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+  });
+}
+
+function errorResponse(res, status, message, type) {
+  const error = type ? { message, type } : message;
+  if (res.headersSent) {
+    res.end(streamFrame({ error: { message, type: type ?? "gateway_error" } }));
+    return;
+  }
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error }));
+}
+
+function sendCompletion(res, payload, completion, { content, toolCalls }, streamed) {
   const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
   const message = { role: "assistant", content };
   const finishReason = toolCalls ? "tool_calls" : "stop";
@@ -121,21 +188,19 @@ function sendCompletion(res, payload, requestId, { content, toolCalls }) {
     const includeUsage = payload.stream_options?.include_usage === true;
     const delta = toolCalls
       ? { role: "assistant", tool_calls: toolCalls.map((call, index) => ({ index, ...call })) }
-      : message;
-    const events = [
-      { ...chunk, choices: [{ index: 0, delta, finish_reason: null }] },
-      { ...chunk, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] },
-    ];
+      : streamed ? { content: content.slice(streamed.length) } : message;
+    const events = [];
+    if (!streamed || delta.content) {
+      events.push({ ...chunk, choices: [{ index: 0, delta, finish_reason: null }] });
+    }
+    events.push({ ...chunk, choices: [{ index: 0, delta: {}, finish_reason: finishReason }] });
     if (includeUsage) {
       for (const event of events) event.usage = null;
       events.push({ ...chunk, choices: [], usage });
     }
 
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-    });
-    const frames = events.map((event) => `data: ${JSON.stringify(event)}\n\n`);
+    startEventStream(res);
+    const frames = events.map(streamFrame);
     res.end(frames.join("") + "data: [DONE]\n\n");
     return;
   }
@@ -153,10 +218,37 @@ function sendCompletion(res, payload, requestId, { content, toolCalls }) {
 
 // ── HTTP server ────────────────────────────────────────────
 
-const server = createServer(async (req, res) => {
-  // CORS
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+function loopbackHost(host = "") {
+  return /^(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?$/i.test(host);
+}
+
+function extensionOrigin(origin = "") {
+  return /^(?:chrome|moz)-extension:\/\/[a-z0-9-]+$/i.test(origin);
+}
+
+function localOrigin(origin) {
+  return extensionOrigin(origin) ||
+    /^https?:\/\//i.test(origin) && loopbackHost(origin.split("://")[1]);
+}
+
+function hasApiKey(header) {
+  if (!API_KEY) return true;
+  const expected = Buffer.from(`Bearer ${API_KEY}`);
+  const received = Buffer.from(header ?? "");
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+
+async function handleHttp(req, res) {
+  const origin = req.headers.origin;
+  if (!loopbackHost(req.headers.host) || (origin && !localOrigin(origin))) {
+    errorResponse(res, 403, "The gateway accepts only local requests");
+    return;
+  }
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type, Authorization"
@@ -175,9 +267,21 @@ const server = createServer(async (req, res) => {
       JSON.stringify({
         status: "ok",
         extensionConnected: !!extensionWs,
+        imageAttachments: extensionCapabilities.get(extensionWs)?.has("imageAttachments") ?? false,
+        conversationReuse: extensionCapabilities.get(extensionWs)?.has("conversationReuse") ?? false,
         pendingRequests: pending.size,
       })
     );
+    return;
+  }
+
+  if (!hasApiKey(req.headers.authorization)) {
+    errorResponse(res, 401, "Use the configured gateway API key as a Bearer token");
+    return;
+  }
+  if (req.method === "GET" && req.url === "/metrics") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ...metrics, pendingRequests: pending.size, browserBusy: !!activeRequest }));
     return;
   }
 
@@ -193,12 +297,25 @@ const server = createServer(async (req, res) => {
 
   // OpenAI-compatible chat completions
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+      req.resume();
+      errorResponse(res, 413, "Request body exceeds 32 MiB");
+      return;
+    }
     let payload;
     try {
-      req.setEncoding("utf8");
-      let body = "";
-      for await (const chunk of req) body += chunk;
-      payload = JSON.parse(body);
+      const chunks = [];
+      let bytes = 0;
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
+        bytes += chunk.length;
+        if (bytes > MAX_BODY_BYTES) {
+          req.resume();
+          errorResponse(res, 413, "Request body exceeds 32 MiB");
+          return;
+        }
+        chunks.push(chunk);
+      }
+      payload = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8"));
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Expected request object");
       }
@@ -230,24 +347,50 @@ const server = createServer(async (req, res) => {
       );
       return;
     }
+    if (chat.attachments.length && !extensionCapabilities.get(socket)?.has("imageAttachments")) {
+      errorResponse(res, 503, "Reload the updated browser extension and refresh ChatGPT to enable image attachments");
+      return;
+    }
 
     const timeoutMs = parseInt(payload.timeout || DEFAULT_REQUEST_TIMEOUT, 10);
+    const completion = {
+      id: `chatcmpl-${requestId}`,
+      created: Math.floor(Date.now() / 1000),
+      model: payload.model || "chatgpt-web",
+    };
     const message = {
       type: "chat",
       requestId,
       model: payload.model || "auto",
       messages: chat.messages,
+      attachments: chat.attachments,
+      streamText: payload.stream === true && chat.streamText,
       newConversation: payload.new_conversation !== false,
     };
 
+    metrics.accepted++;
+    let streamed = "";
+    const onProgress = (content) => {
+      if (!message.streamText || res.destroyed || content === streamed || !content.startsWith(streamed)) return;
+      startEventStream(res);
+      const delta = streamed ? {} : { role: "assistant" };
+      delta.content = content.slice(streamed.length);
+      streamed = content;
+      res.write(streamFrame({
+        ...completion, object: "chat.completion.chunk",
+        choices: [{ index: 0, delta, finish_reason: null }],
+        ...(payload.stream_options?.include_usage === true ? { usage: null } : {}),
+      }));
+    };
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         const location = activeRequest?.requestId === requestId ? "ChatGPT response" : "an available browser tab";
         pending.delete(requestId);
+        metrics.timedOut++;
         console.warn(`[gateway] Timed out waiting for ${location} for ${requestId}`);
         reject(new Error(`Timeout waiting for ${location}`));
       }, timeoutMs);
-      pending.set(requestId, { socket, message, resolve, reject, timer });
+      pending.set(requestId, { socket, message, payload, resolve, reject, timer, onProgress, queuedAt: Date.now() });
     });
 
     // The request body can finish while the client is still waiting for our reply.
@@ -262,25 +405,30 @@ const server = createServer(async (req, res) => {
       if (res.destroyed) return;
 
       if (!result.ok) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: result.error }));
+        metrics.failed++;
+        errorResponse(res, 500, result.error);
         return;
       }
 
-      let completion;
+      let decoded;
       try {
-        completion = chat.decode(result.content);
+        decoded = chat.decode(result.content);
+        if (streamed && !decoded.content?.startsWith(streamed)) {
+          throw new Error("ChatGPT revised the streamed text. Retry for the complete reply.");
+        }
       } catch (err) {
+        metrics.failed++;
         console.warn(`[gateway] Rejected browser reply for ${requestId}: ${err.message}`);
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: { message: err.message, type: "invalid_tool_call" } }));
+        errorResponse(res, 502, err.message, streamed ? "revised_response" : "invalid_tool_call");
         return;
       }
-      sendCompletion(res, payload, requestId, completion);
+      rememberConversation(socket, payload, message.model, result, decoded);
+      sendCompletion(res, payload, completion, decoded, streamed);
+      metrics.completed++;
     } catch (err) {
       if (res.destroyed) return;
-      res.writeHead(504, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      metrics.failed++;
+      errorResponse(res, 504, err.message);
     }
     return;
   }
@@ -288,21 +436,30 @@ const server = createServer(async (req, res) => {
   // Fallback
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "Not found" }));
-});
+}
 
-// WebSocket upgrade handler
-server.on("upgrade", (req, socket, head) => {
-  if (req.url === "/ws") {
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-  } else {
-    socket.destroy();
-  }
-});
+function listener() {
+  const server = createServer(handleHttp);
+  server.on("upgrade", (req, socket, head) => {
+    const origin = req.headers.origin;
+    const allowed = EXTENSION_ORIGIN ? origin === EXTENSION_ORIGIN : !origin || extensionOrigin(origin);
+    if (req.url !== "/ws" || !loopbackHost(req.headers.host) || !allowed) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  });
+  return server;
+}
 
-server.listen(PORT, () => {
+const server = listener();
+server.listen(PORT, "127.0.0.1", () => {
   const { port } = server.address();
+  const ipv6 = listener();
+  ipv6.on("error", (err) => {
+    if (!["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes(err.code)) throw err;
+  });
+  ipv6.listen(port, "::1");
   console.log(`
   ChatGPT Gateway Server
   ──────────────────────
