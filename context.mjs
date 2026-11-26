@@ -34,6 +34,7 @@ export function clientContext(payload) {
   const baseline = !tools && messages.length === 1 && messages[0].role === "user" && typeof messages[0].content === "string"
     ? messages[0].content : JSON.stringify(context, null, 2);
   // Browser-side vision accounting is private. Reserve a fixed estimate per image.
-  const tokens = estimateTokens(JSON.stringify(context)) + imageCount * 1024;
-  return { tokens, baselineBytes: Buffer.byteLength(baseline) };
+  const compact = JSON.stringify(context);
+  const tokens = estimateTokens(compact) + imageCount * 1024;
+  return { tokens, baselineBytes: Buffer.byteLength(baseline), logicalBytes: Buffer.byteLength(compact) };
 }

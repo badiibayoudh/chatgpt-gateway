@@ -80,7 +80,7 @@ function parseJson(json) {
   }
 }
 
-function decodeReply(content, selection, validators, requestId) {
+function decodeReply(content, selection, validators, requestId, observe) {
   const { required, parallel } = selection;
   const json = unwrapJson(content);
   const reply = parseJson(json);
@@ -104,11 +104,17 @@ function decodeReply(content, selection, validators, requestId) {
   }
 
   const toolCalls = calls.map((call, index) => {
+    observe?.("tool.requested", call?.name);
     const validate = validators.get(call?.name);
-    if (!validate) throw new Error("ChatGPT requested a function outside the allowed list");
+    if (!validate) {
+      observe?.("tool.validation_failed", call?.name);
+      throw new Error("ChatGPT requested a function outside the allowed list");
+    }
     if (!isObject(call.arguments) || !validate(call.arguments)) {
+      observe?.("tool.validation_failed", call.name);
       throw new Error(`ChatGPT returned invalid arguments for ${call.name}`);
     }
+    observe?.("tool.validated", call.name);
     return {
       id: `call_${requestId.replace(/-/g, "")}_${index}`,
       type: "function",
@@ -179,8 +185,10 @@ export function prepareChat(payload, requestId, continuation, options) {
   const last = normalized.at(-1)?.message;
   if (functions.length) {
     parts.unshift(toolInstructions(selection, requestId, toolsReused));
-    const validators = compileTools(functions);
-    decode = (content) => decodeReply(content, selection, validators, requestId);
+    if (!options?.referenceOnly) {
+      const validators = compileTools(functions);
+      decode = (content, observe) => decodeReply(content, selection, validators, requestId, observe);
+    }
     streamText = false;
   } else if (last?.role === "assistant" && /^```[^\n`]*\s*$/.test(last.content ?? "")) {
     // Carry Continue Apply's code as JSON to preserve exact line breaks.
@@ -194,8 +202,13 @@ export function prepareChat(payload, requestId, continuation, options) {
     streamText = false;
   }
 
-  const { transcript, attachments } = assembleTranscript(normalized, { ...options, allImagesCurrent: !!continuation });
+  const { transcript, attachments, attachmentStats } = assembleTranscript(normalized, { ...options, allImagesCurrent: !!continuation });
   const metadata = { attachments, decode, streamText, toolsKey, toolsReused, hasTools: functions.length > 0 };
+  if (options?.monitor) {
+    metadata.observation = { attachmentStats, forwardedMessages: messages.length,
+      exposedTools: functions.length, names: functions.slice(0, 100).map(({ name }) => name),
+      toolDefinitionBytes: toolsReused || !functions.length ? 0 : Buffer.byteLength(JSON.stringify(functions)) };
+  }
   if (streamText && !toolsDisabled && !continuation?.clearInstructions && !attachments.length &&
     messages.length <= 1 && messages.every(({ role }) => role === "user")) {
     return { messages: transcript, ...metadata };

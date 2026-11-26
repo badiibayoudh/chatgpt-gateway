@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Gateway Monitor</title>
+  <link rel="stylesheet" href="/dashboard/assets/styles.css">
+  <script type="module" src="/dashboard/assets/app.js"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-icon" aria-hidden="true"><i></i><i></i><i></i></span><span>Gateway Monitor</span></div>
+      <nav aria-label="Dashboard">
+        <button data-view="overview" aria-current="page"><span aria-hidden="true">◈</span>Overview</button>
+        <button data-view="requests"><span aria-hidden="true">≡</span>Requests</button>
+        <button data-view="context"><span aria-hidden="true">⇄</span>Context</button>
+        <button data-view="tools"><span aria-hidden="true">◇</span>Tools</button>
+        <button data-view="logs"><span aria-hidden="true">▤</span>Logs</button>
+      </nav>
+      <div class="sidebar-footer"><span class="fine">Gateway endpoint</span><span id="endpoint" class="mono">localhost</span></div>
+    </aside>
+    <main id="main">
+      <header class="topbar">
+        <span id="connection" class="pill neutral" role="status">Connecting</span>
+        <div class="top-actions"><span id="refresh-status" class="fine" role="status"></span><button id="refresh" type="button">Refresh</button><button id="access" type="button">Access key</button></div>
+      </header>
+      <div class="body">
+        <div class="heading"><h1 id="title">Overview</h1><div id="view-actions" class="actions"></div></div>
+        <div id="notice" role="status" class="notice" hidden></div>
+        <section id="filters" aria-label="Filters" hidden></section>
+        <section id="view" aria-label="Dashboard data"><p class="fine">Waiting for the local gateway.</p></section>
+        <div id="pagination" class="pagination" hidden><button id="previous">Previous</button><span id="page-number" class="fine"></span><button id="next">Next</button></div>
+      </div>
+    </main>
+  </div>
+  <dialog id="auth" aria-labelledby="auth-title">
+    <form id="auth-form">
+      <h2 id="auth-title">Gateway access key</h2>
+      <p class="fine">The key stays in this dashboard tab’s memory.</p>
+      <label for="key">API key</label><input id="key" type="password" autocomplete="off" spellcheck="false">
+      <div class="actions"><button type="button" data-close="auth">Close</button><button class="primary" type="submit">Connect</button></div>
+    </form>
+  </dialog>
+  <dialog id="inspector" class="inspector" aria-labelledby="inspector-title">
+    <div class="detail-head"><div><h2 id="inspector-title">Request inspector</h2><span id="detail-id" class="mono fine"></span></div><button data-close="inspector" type="button">Close</button></div>
+    <div class="actions detail-actions"><button id="copy-detail" type="button" disabled>Copy summary</button><button id="download-detail" type="button" disabled>Download JSON</button><span id="detail-notice" class="fine" role="status"></span></div>
+    <div id="detail"></div>
+  </dialog>
+</body>
+</html>

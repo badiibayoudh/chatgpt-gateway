@@ -190,6 +190,41 @@ Returns request outcomes, queue and browser timings, and aggregate diagnostics. 
 - `oversizedRequestCount` counts size-limit errors and recovered oversized drafts. `uploadAllowanceErrors` counts ChatGPT upload-allowance failures.
 - `redundantDataAvoidedPercent` compares the original full text baseline with prompt and text-attachment bytes delivered to the extension. The baseline uses pretty-printed client history and tool definitions with image data excluded, or plain text for a single text-only user message. The estimate includes gateway prompt overhead and is floored at zero.
 
+## Gateway Monitor
+
+Start the gateway with `npm start` and open [Gateway Monitor](http://localhost:18790/dashboard). The Overview shows gateway and extension status. Open a row in Requests to inspect queue, browser, validation, and client delivery events. Context shows comparable prompt sizes when both are available. Tools links gateway-issued calls to later IDE results, and Logs filters events and exports diagnostic bundles.
+
+Reload the unpacked extension and refresh ChatGPT after upgrading. Existing extensions still work and provide the gateway-side events. The new extension adds separately observed browser submission, generation, and attachment stages. A browser readiness observation becomes unknown after 60 seconds without another observation. Tool results indicate that the IDE returned a result. The gateway does not observe tool execution or account-wide upload allowance.
+
+With `CHATGPT_GATEWAY_API_KEY` configured, data requests require the same bearer key. Use **Access key** in the dashboard to enter it for the current tab. Without a key, other processes on the machine can read local monitoring data. Dashboard requests are read-only and restricted to the dashboard’s own loopback origin.
+
+| Server setting | Default | Allowed values |
+|---|---:|---|
+| `CHATGPT_GATEWAY_MONITOR_ENABLED` | `true` | `true`, `false`, `1`, `0` |
+| `CHATGPT_GATEWAY_MONITOR_REQUESTS` | `500` | 1–2,000 completed summaries |
+| `CHATGPT_GATEWAY_MONITOR_EVENTS` | `5000` | 1–20,000 recent events |
+| `CHATGPT_GATEWAY_MONITOR_EVENT_BYTES` | `8388608` | 4 KiB–32 MiB in memory |
+| `CHATGPT_GATEWAY_MONITOR_PERSIST` | `false` | Explicit opt-in for sanitized JSONL |
+| `CHATGPT_GATEWAY_MONITOR_LOG_DIR` | OS-local `chatgpt-gateway/monitor` | Local path set by the server operator |
+| `CHATGPT_GATEWAY_MONITOR_LOG_BYTES` | `5242880` | 4 KiB–16 MiB per JSONL file |
+| `CHATGPT_GATEWAY_MONITOR_LOG_FILES` | `5` | 1–10 files including the active file |
+| `CHATGPT_GATEWAY_MONITOR_WRITE_QUEUE` | `1000` | 1–2,000 queued writes |
+| `CHATGPT_GATEWAY_MONITOR_EXPORT_BYTES` | `1048576` | 8 KiB–4 MiB per diagnostic bundle |
+
+Memory retention also limits active summaries, tool names, and recent tool-call correlations. The dashboard polls at two-second intervals while visible, backs off on failures, and shows when data is stale. Memory resets on gateway restart. Persistent logs stay on disk and are never loaded automatically into the current dashboard.
+
+The `/monitor` API supports `GET /monitor/status`, `/monitor/requests`, `/monitor/requests/:id`, `/monitor/conversations`, `/monitor/tools`, `/monitor/logs`, and `/monitor/export`. Lists accept `limit` from 1 to 200 and return a `nextCursor` where supported. Requests accept `state`, `code`, `q`, `requestId`, and UTC `from`/`to`. Logs and exports accept `level`, `component`, `event`, `code`, `requestId`, and UTC `from`/`to`. Exports support `format=json` and `format=jsonl`. Data includes a schema version, process session ID, and retention information. The event envelope records the event name, sequence, server timestamp, component, optional request and opaque conversation IDs, and allowlisted observations.
+
+Copy a summary from an open request or download a bounded export. This is an example of one sanitized event in an export.
+
+```json
+{"schemaVersion":1,"event":"attachment.accepted","component":"content-script","data":{"kind":"image","bytes":16384}}
+```
+
+When diagnosing a request, compare `preparedTextBytes` and `fullTextBytes` with `forwardedTextBytes` plus `textAttachmentBytes`. A comparable full-prompt value is unavailable when a continuation cannot be rendered safely within the 256 KiB input comparison bound. An attachment acceptance means the composer confirmed the upload. Token figures remain estimates. See the [monitor roadmap](MONITORING_ROADMAP.md) for benchmark results and test evidence.
+
+Set `CHATGPT_GATEWAY_MONITOR_ENABLED=false` and restart to disable monitoring. To remove retained diagnostics, stop the gateway and remove only its `gateway-monitor*.jsonl` files in the configured log directory. The defaults are `%LOCALAPPDATA%/chatgpt-gateway/monitor` on Windows and `~/.local/state/chatgpt-gateway/monitor` elsewhere. If the dashboard reports a disconnected extension, check `/health` and reload the extension. If only browser observations are missing, send a test message and check that `telemetryV1` is listed under Extension.
+
 ## MCP Server
 
 The `mcp/` directory contains a [Model Context Protocol](https://modelcontextprotocol.io) server that wraps the gateway. This lets AI tools like Claude Code use ChatGPT directly as a tool.

@@ -7,7 +7,7 @@ const HEARTBEAT_INTERVAL = 20_000;
 const utf8 = new TextEncoder();
 let ws = null;
 let reconnectTimer = null;
-const streamingRequests = new Map();
+const browserRequests = new Map();
 
 function log(...args) {
   console.log("[Gateway BG]", ...args);
@@ -30,7 +30,7 @@ function connect() {
     log("Connected to gateway server");
     sendToServer(socket, {
       type: "hello",
-      capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics"],
+      capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1"],
     });
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
@@ -56,6 +56,7 @@ function connect() {
     try {
       await handleChatMessage(msg, socket);
     } catch (err) {
+      if (/could not reopen/i.test(err.message)) emitTelemetry(socket, msg, "browser.tab_unavailable");
       sendToServer(socket, {
         type: "response",
         requestId: msg.requestId,
@@ -92,6 +93,14 @@ function sendToServer(socket, data) {
   }
 }
 
+function emitTelemetry(socket, msg, event, data = {}, component = "background") {
+  if (msg.telemetry !== 1) return;
+  try {
+    sendToServer(socket, { type: "telemetry", version: 1, requestId: msg.requestId,
+      events: [{ requestId: msg.requestId, component, event, data }] });
+  } catch { /* Observability must not prevent a browser reply. */ }
+}
+
 function userText(messages = []) {
   const content = [...messages].reverse().find(({ role }) => role === "user")?.content;
   return Array.isArray(content)
@@ -124,6 +133,7 @@ async function handleChatMessage(msg, socket) {
   const continuation = msg.continuation;
   const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
   if (!continuation && tabs.length === 0) {
+    emitTelemetry(socket, msg, "browser.tab_unavailable");
     sendToServer(socket, {
       type: "response",
       requestId: msg.requestId,
@@ -158,7 +168,8 @@ async function handleChatMessage(msg, socket) {
   const errors = [];
   for (const tab of candidates) {
     try {
-      if (msg.streamText) streamingRequests.set(msg.requestId, { socket, tabId: tab.id });
+      if (msg.streamText || msg.telemetry === 1) browserRequests.set(msg.requestId, { socket, tabId: tab.id, msg });
+      emitTelemetry(socket, msg, "browser.tab_located");
       const send = async (text, files, newConversation, expectedDraftUrl, fallback = false) => {
         const response = await chrome.tabs.sendMessage(tab.id, {
           type: "chat",
@@ -170,6 +181,7 @@ async function handleChatMessage(msg, socket) {
           newConversation,
           expectedConversation,
           expectedDraftUrl,
+          ...(msg.telemetry === 1 ? { telemetry: 1 } : {}),
         });
         if (!response.conversationChanged) {
           sendToServer(socket, {
@@ -196,9 +208,12 @@ async function handleChatMessage(msg, socket) {
         const instruction = `Read ${name} as the original request for this turn. Use the conversation, tool definitions, and response format specified there. Reply to the latest message or tool result. If that request calls for gateway_request_id, use ${msg.requestId}.`;
         let retry;
         try {
-          retry = msg.maxPromptBytes && utf8.encode(instruction).byteLength > msg.maxPromptBytes
-            ? { ok: false, error: "The fallback prompt exceeds the configured byte limit", errorCode: response.errorCode }
-            : await send(instruction, files, !draftUrl && newConversation, draftUrl, true);
+          if (msg.maxPromptBytes && utf8.encode(instruction).byteLength > msg.maxPromptBytes) {
+            retry = { ok: false, error: "The fallback prompt exceeds the configured byte limit", errorCode: response.errorCode };
+          } else {
+            emitTelemetry(socket, msg, "attachment.fallback", { code: "context_length", keptDraft: !!draftUrl });
+            retry = await send(instruction, files, !draftUrl && newConversation, draftUrl, true);
+          }
         } catch (err) {
           retry = { ok: false, error: err.message };
         }
@@ -223,11 +238,12 @@ async function handleChatMessage(msg, socket) {
     } catch (err) {
       errors.push(`Tab ${tab.id}: ${err.message}`);
     } finally {
-      streamingRequests.delete(msg.requestId);
+      browserRequests.delete(msg.requestId);
     }
   }
 
   // All tabs failed
+  emitTelemetry(socket, msg, "browser.tab_unavailable");
   sendToServer(socket, {
     type: "response",
     requestId: msg.requestId,
@@ -237,10 +253,11 @@ async function handleChatMessage(msg, socket) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender) => {
-  if (msg.type !== "chat-progress") return;
-  const request = streamingRequests.get(msg.requestId);
+  if (msg.type !== "chat-progress" && msg.type !== "gateway-telemetry") return;
+  const request = browserRequests.get(msg.requestId);
   if (request && sender.tab?.id === request.tabId && sender.frameId === 0) {
-    sendToServer(request.socket, { type: "progress", requestId: msg.requestId, content: msg.content });
+    if (msg.type === "gateway-telemetry") emitTelemetry(request.socket, request.msg, msg.event, msg.data, "content-script");
+    else if (request.msg.streamText) sendToServer(request.socket, { type: "progress", requestId: msg.requestId, content: msg.content });
   }
 });
 

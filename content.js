@@ -297,13 +297,24 @@
     return { named: namedPreviews.length, composer: composerPreviews.length };
   }
 
-  async function attachFiles(attachments) {
+  async function attachFiles(attachments, observe) {
     if (!attachments?.length) return;
     await waitForInput();
     const composer = () => (document.querySelector("#prompt-textarea") || findInput())?.closest("form");
     if (!composer()) throw new Error("Cannot find the ChatGPT attachment composer");
     const uploadDeadline = Date.now() + 45_000;
     for (const attachment of attachments) {
+      const info = { kind: typeof attachment.text === "string" ? "text" : "image" };
+      try {
+        await attachFile(attachment, composer, uploadDeadline, observe, info);
+      } catch (err) {
+        observe?.("attachment.failed", { ...info, code: err.code === "chatgpt_upload_allowance" ? "upload_allowance" : "upload_unconfirmed" });
+        throw err;
+      }
+    }
+  }
+
+  async function attachFile(attachment, composer, uploadDeadline, observe, info) {
       if (platformNotices(UPLOAD_ALLOWANCE).size) throw uploadAllowanceError();
       const previous = attachmentCounts(composer(), attachment.name);
       const fileInput = () => document.querySelector('#upload-files[type="file"]') ||
@@ -324,8 +335,10 @@
         ? attachment.text
         : Uint8Array.from(atob(attachment.data), (character) => character.charCodeAt(0));
       const transfer = new DataTransfer();
-      transfer.items.add(new File([data], attachment.name, { type: attachment.mimeType }));
+      const file = new File([data], attachment.name, { type: attachment.mimeType });
+      transfer.items.add(file);
       picker.files = transfer.files;
+      if (observe) { info.bytes = file.size; observe("attachment.attempted", info); }
       picker.dispatchEvent(new Event("input", { bubbles: true }));
       picker.dispatchEvent(new Event("change", { bubbles: true }));
 
@@ -342,7 +355,7 @@
         }
       }
       if (!confirmed) throw new Error(`ChatGPT did not confirm upload of ${attachment.name}`);
-    }
+      observe?.("attachment.accepted", info);
   }
 
   function isOversizedDraft() {
@@ -384,13 +397,18 @@
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress) {
+  async function waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe) {
     const deadline = Date.now() + MAX_WAIT;
     let lastTurnId = null;
     let lastText = "";
     let stableCount = 0;
+    let generationObserved = false;
 
     while (Date.now() < deadline) {
+      if (observe && !generationObserved && isGenerating()) {
+        generationObserved = true;
+        observe("browser.generation_detected");
+      }
       if (!lastText && [...platformNotices(UPLOAD_ALLOWANCE)].some((notice) => !previousUploadNotices.has(notice))) {
         throw uploadAllowanceError();
       }
@@ -414,6 +432,7 @@
           lastTurnId = turnId;
           lastText = text;
           if (text && !generating && (turn.querySelector(COPY_REPLY) || stableCount >= 2)) {
+            observe?.("browser.response_received", { characters: text.length });
             return text;
           }
         }
@@ -430,6 +449,9 @@
 
   async function handleChatRequest(msg) {
     let draftUrl;
+    const observe = msg.telemetry === 1 ? (event, data = {}) => {
+      try { chrome.runtime.sendMessage({ type: "gateway-telemetry", requestId: msg.requestId, event, data }).catch(() => {}); } catch {}
+    } : undefined;
     try {
       const chatUrl = (url) => url?.split(/[?#]/)[0].replace(/\/$/, "");
       const expected = chatUrl(msg.expectedConversation);
@@ -446,7 +468,7 @@
       if (msg.attachments?.length) {
         // Keep Send's upload readiness separate from the length of the final draft.
         await typeMessage("Preparing gateway attachments");
-        await attachFiles(msg.attachments);
+        await attachFiles(msg.attachments, observe);
       }
       await typeMessage(msg.userMessage);
       if (conversationChanged() || draftChanged()) return { ok: false, conversationChanged: true };
@@ -457,6 +479,7 @@
       const previousUploadNotices = platformNotices(UPLOAD_ALLOWANCE);
       draftUrl = window.location.href;
       await clickSend(msg.userMessage, msg.attachments?.length);
+      observe?.("browser.prompt_submitted");
 
       let streamed = "";
       const onProgress = msg.streamText ? (content) => {
@@ -464,11 +487,13 @@
         streamed = content;
         chrome.runtime.sendMessage({ type: "chat-progress", requestId: msg.requestId, content }).catch(() => {});
       } : undefined;
-      const response = await waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress);
+      const response = await waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe);
 
       if (conversationChanged()) throw new Error("ChatGPT conversation changed after submitting the prompt");
       return { ok: true, content: response, url: window.location.href };
     } catch (err) {
+      if (err.code === "chatgpt_upload_allowance") observe?.("browser.prompt_rejected", { code: "upload_allowance" });
+      if (err.code === "chatgpt_input_too_long" || err.code === "chatgpt_draft_blocked") observe?.("browser.prompt_rejected", { code: "context_length" });
       const retryDraftUrl = err.retryDraft && window.location.href === draftUrl ? draftUrl : undefined;
       return { ok: false, error: err.message, errorCode: err.code, retryDraftUrl };
     }

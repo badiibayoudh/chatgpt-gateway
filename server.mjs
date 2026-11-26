@@ -6,6 +6,9 @@ import { WebSocket, WebSocketServer } from "ws";
 import { chatMessages, prepareChat } from "./chat-tools.mjs";
 import { conversationKey, describeHistory, messageKey, newMessages, toolCallKeys } from "./chat-history.mjs";
 import { clientContext, contextSettings, estimateTokens } from "./context.mjs";
+import { createMonitor } from "./monitoring/index.mjs";
+import { isMonitorPath, monitorRoutes } from "./monitoring/routes.mjs";
+import { browserError, monitorCapabilities, safeModel, safeName } from "./monitoring/events.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
 const MAX_BROWSER_WAIT = 240_000;
@@ -16,6 +19,8 @@ const MAX_TRACKED_CHATS = 100;
 const API_KEY = process.env.CHATGPT_GATEWAY_API_KEY;
 const EXTENSION_ORIGIN = process.env.CHATGPT_GATEWAY_EXTENSION_ORIGIN;
 const settings = contextSettings();
+const monitor = createMonitor();
+monitor.emit("gateway.started");
 const extensionCapabilities = new WeakMap();
 const conversations = new Map();
 const metrics = {
@@ -46,6 +51,7 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_BODY_BYTES });
 
 wss.on("connection", (ws) => {
   console.log("[gateway] Extension connected");
+  monitor.emit("gateway.extension_connected");
   extensionWs = ws;
   ws.on("error", (err) => console.warn("[gateway] Extension socket error:", err.code ?? err.name));
 
@@ -59,6 +65,12 @@ wss.on("connection", (ws) => {
 
     if (msg?.type === "hello" && Array.isArray(msg.capabilities)) {
       extensionCapabilities.set(ws, new Set(msg.capabilities));
+      if (ws === extensionWs) monitor.emit("gateway.extension_capabilities", null,
+        { capabilities: monitorCapabilities(extensionCapabilities.get(ws)) });
+    } else if (msg?.type === "telemetry" && monitor.enabled) {
+      const valid = msg.version === 1 && raw.length <= 64 * 1024 && activeRequest?.socket === ws &&
+        activeRequest.requestId === msg.requestId && extensionCapabilities.get(ws)?.has("telemetryV1");
+      monitor.extension(valid ? msg.requestId : null, valid ? msg.events : null);
     } else if (msg?.type === "response") {
       finishBrowserRequest(ws, msg.requestId, msg);
     } else if (msg?.type === "chat-transmission" && activeRequest?.socket === ws && activeRequest.requestId === msg.requestId) {
@@ -71,10 +83,11 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("[gateway] Extension disconnected");
-    if (extensionWs === ws) extensionWs = null;
+    if (extensionWs === ws) { extensionWs = null; monitor.emit("gateway.extension_disconnected"); }
     if (activeRequest?.socket === ws) releaseBrowser();
     for (const [requestId, entry] of pending) {
       if (entry.socket === ws) {
+        monitor.emit("request.failed", requestId, { code: "extension_unavailable" });
         resolveRequest(requestId, {
           ok: false,
           error: "Browser extension disconnected while waiting for ChatGPT",
@@ -98,7 +111,7 @@ function dispatchNextRequest() {
     prepared = prepareBrowserChat(payload, message, capabilities);
   } catch (err) {
     if (err.code === "image_budget_exceeded") metrics.oversizedRequestCount++;
-    rejectQueued(requestId, 400, err.message, "invalid_request_error");
+    rejectQueued(requestId, 400, err.message, "invalid_request_error", err.code === "image_budget_exceeded" ? "image_budget" : "invalid_request");
     return;
   }
   if (prepared.attachmentsNeedSupport) {
@@ -111,7 +124,7 @@ function dispatchNextRequest() {
     promptBytes: typeof prompt === "string" ? Buffer.byteLength(prompt) : 0, images: chat.attachments.length, textBytes: 0 };
   if (settings.maxPromptBytes && promptStats.promptBytes > settings.maxPromptBytes) {
     metrics.oversizedRequestCount++;
-    rejectQueued(requestId, 413, `Browser prompt exceeds ${settings.maxPromptBytes} bytes. Send a smaller file selection, tool result, or task.`, "context_length_exceeded");
+    rejectQueued(requestId, 413, `Browser prompt exceeds ${settings.maxPromptBytes} bytes. Send a smaller file selection, tool result, or task.`, "context_length_exceeded", "context_length");
     return;
   }
   if ((!settings.textAttachmentFallback || settings.maxPromptBytes) && !capabilities?.has("attachmentPolicy")) {
@@ -128,6 +141,8 @@ function dispatchNextRequest() {
     continuedChat: conversationKey(outgoing.continuation?.url), baselineBytes: context.baselineBytes,
   };
   metrics.accepted++;
+  observePrepared(requestId, payload, prepared, context);
+  monitor.emit("request.dispatched", requestId);
   metrics[outgoing.continuation ? "continuationRequests" : "fullHistoryRequests"]++;
   if (chat.hasTools) metrics.toolDefinitionRequests++;
   if (chat.toolsReused) metrics.toolDefinitionReuses++;
@@ -139,12 +154,14 @@ function dispatchNextRequest() {
       finishBrowserRequest(socket, requestId, {
         ok: false,
         error: "Could not send request to the browser extension",
+        monitorCode: "extension_send",
       });
     }
   });
 }
 
-function rejectQueued(requestId, status, error, errorCode) {
+function rejectQueued(requestId, status, error, errorCode, code = "extension_upgrade") {
+  monitor.emit("request.failed", requestId, { code });
   resolveRequest(requestId, { ok: false, status, error, errorCode });
   queueMicrotask(dispatchNextRequest);
 }
@@ -172,33 +189,58 @@ function prepareBrowserChat(payload, message, capabilities) {
   const history = describeHistory(payload.messages);
   const match = matchContinuation(payload, message, history);
   metrics.historyMatches[match.reason]++;
+  monitor.emit(match.previous ? "context.matched" : "context.reuse_missed", message.requestId, { reason: match.reason }, "gateway", conversationKey(match.previous?.url));
   let continuation;
   let chat;
   if (match.previous) {
     const { tabId, url, toolsKey } = match.previous;
     chat = prepareChat({ ...payload, messages: match.messages }, message.requestId, {
       toolsKey, clearInstructions: match.clearInstructions,
-    }, { includeHistoricalImages: settings.includeHistoricalImages });
+    }, { includeHistoricalImages: settings.includeHistoricalImages, monitor: monitor.enabled });
     continuation = { tabId, url, messages: chat.messages, attachments: chat.attachments };
   }
 
   // Older extensions still expect the fallback payload alongside a continuation.
   const full = !continuation || !capabilities?.has("continuationOnly")
-    ? prepareChat(payload, message.requestId, undefined, { includeHistoricalImages: settings.includeHistoricalImages }) : null;
+    ? prepareChat(payload, message.requestId, undefined, { includeHistoricalImages: settings.includeHistoricalImages, monitor: monitor.enabled }) : null;
   chat ??= full;
   const outgoing = {
     ...message, continuation, newConversation: !!full,
     streamText: payload.stream === true && chat.streamText, textAttachmentFallback: settings.textAttachmentFallback,
     maxPromptBytes: settings.maxPromptBytes,
+    ...(monitor.enabled && capabilities?.has("telemetryV1") ? { telemetry: 1 } : {}),
   };
   if (full) {
     outgoing.messages = full.messages;
     outgoing.attachments = full.attachments;
   }
   return {
-    chat, outgoing, history: { keys: history.keys, instructionsKey: history.instructionsKey },
+    chat, outgoing, full, newMessages: match.messages, history: { keys: history.keys, instructionsKey: history.instructionsKey },
     attachmentsNeedSupport: (chat.attachments.length || full?.attachments.length) && !capabilities?.has("imageAttachments"),
   };
+}
+
+function observePrepared(requestId, payload, prepared, context) {
+  if (!monitor.enabled) return;
+  try {
+    const { chat, outgoing, full, newMessages } = prepared;
+    let reference = full;
+    if (!reference && context.incomingBytes <= 256 * 1024) {
+      try {
+        reference = prepareChat(payload, requestId, undefined, { includeHistoricalImages: settings.includeHistoricalImages, referenceOnly: true });
+      } catch { /* Historical images or message types can make a comparable full prompt unavailable. */ }
+    }
+    const bytes = (turn) => typeof turn?.messages[0]?.content === "string" ? Buffer.byteLength(turn.messages[0].content) : undefined;
+    const { attachmentStats, names, ...stats } = chat.observation;
+    monitor.emit("context.prepared", requestId, { ...stats, toolsReused: chat.toolsReused,
+      mode: outgoing.continuation ? "continuation" : "full", preparedTextBytes: bytes(chat), fullTextBytes: bytes(reference) });
+    monitor.emit("attachment.prepared", requestId, attachmentStats);
+    if (attachmentStats.skipped) monitor.emit("attachment.skipped", requestId, { kind: "image", count: attachmentStats.skipped });
+    for (const name of names) monitor.emit("tool.exposed", requestId, { name: safeName(name) ?? "redacted" });
+    const messages = newMessages ?? (payload.messages ?? []).slice((payload.messages ?? []).findLastIndex(({ role }) => role === "assistant") + 1);
+    const results = messages.filter(({ role }) => role === "tool").map(({ tool_call_id }) => tool_call_id);
+    monitor.resultsObserved(requestId, conversationKey(outgoing.continuation?.url), results);
+  } catch { /* Monitoring must not change request dispatch. */ }
 }
 
 function rememberConversation(model, result, { content, toolCalls }, toolsKey) {
@@ -226,6 +268,7 @@ function finishBrowserRequest(socket, requestId, result) {
   if (!pending.has(requestId)) conversations.delete(activeRequest.continuedChat);
   const elapsedMs = Date.now() - activeRequest.startedAt;
   const { chat, history } = activeRequest;
+  monitor.emit("browser.reply_relayed", requestId, { ok: result.ok === true });
   const continuedChat = activeRequest.continuedChat;
   if (result.oversized === true || isOversizedError(result.errorCode)) recordOversized();
   if (result.errorCode === "chatgpt_upload_allowance") metrics.uploadAllowanceErrors++;
@@ -249,6 +292,10 @@ function recordOversized() {
 function recordTransmission({ promptCharacters, promptBytes, images, textBytes, fallback }) {
   if (![promptCharacters, promptBytes, images, textBytes].every((value) =>
     Number.isSafeInteger(value) && value >= 0 && value <= MAX_BODY_BYTES)) return;
+  if (extensionCapabilities.get(activeRequest.socket)?.has("contextMetrics")) {
+    monitor.emit("context.transmitted", activeRequest.requestId, { forwardedTextBytes: promptBytes,
+      forwardedCharacters: promptCharacters, textAttachmentBytes: textBytes, fallback: fallback === true });
+  }
   metrics.fullContextBaselineBytes += activeRequest.baselineBytes;
   activeRequest.baselineBytes = 0;
   metrics.outgoingPromptCharacters += promptCharacters;
@@ -269,12 +316,13 @@ function resolveRequest(requestId, result) {
   entry.resolve(result);
 }
 
-function cleanupRequest(requestId) {
+function cleanupRequest(requestId, code = "client_disconnected") {
   const entry = pending.get(requestId);
   if (entry) {
     clearTimeout(entry.timer);
     pending.delete(requestId);
     metrics.cancelled++;
+    monitor.emit("request.cancelled", requestId, { code });
     entry.reject(new Error("Client disconnected"));
   }
 }
@@ -362,12 +410,41 @@ function hasApiKey(header) {
   return received.length === expected.length && timingSafeEqual(received, expected);
 }
 
+function healthSnapshot() {
+  const caps = extensionCapabilities.get(extensionWs);
+  return { status: "ok", extensionConnected: !!extensionWs,
+    imageAttachments: caps?.has("imageAttachments") ?? false, conversationReuse: caps?.has("conversationReuse") ?? false,
+    longMessageFallback: settings.textAttachmentFallback && (caps?.has("longMessageFallback") ?? false), pendingRequests: pending.size };
+}
+
+function metricsSnapshot() {
+  const percent = (part, total) => total ? Math.round(10_000 * part / total) / 100 : 0;
+  const textBytesSent = metrics.outgoingPromptBytes + metrics.textAttachmentBytes;
+  return {
+    ...metrics, pendingRequests: pending.size, browserBusy: !!activeRequest,
+    conversationReuseSuccessRate: percent(metrics.conversationReuseSuccesses, metrics.continuationRequests),
+    toolDefinitionReuseRate: percent(metrics.toolDefinitionReuses, metrics.toolDefinitionRequests),
+    redundantDataAvoidedPercent: percent(Math.max(0, metrics.fullContextBaselineBytes - textBytesSent), metrics.fullContextBaselineBytes),
+  };
+}
+
+const serveMonitor = monitorRoutes(monitor, () => ({
+  health: healthSnapshot(), metrics: metricsSnapshot(), activeRequestId: activeRequest?.requestId ?? null,
+  queued: pending.size - Number(pending.has(activeRequest?.requestId)),
+  capabilities: monitorCapabilities(extensionCapabilities.get(extensionWs)),
+  configuration: { ...settings, apiKeyRequired: !!API_KEY, extensionOriginRestricted: !!EXTENSION_ORIGIN, connectionMode: "loopback", maxBodyBytes: MAX_BODY_BYTES,
+    ...(monitor.config && { requestRetention: monitor.config.requests, eventRetention: monitor.config.events,
+      eventBytes: monitor.config.eventBytes, persist: monitor.config.persist, logFiles: monitor.config.logFiles, logBytes: monitor.config.logBytes }) },
+}), hasApiKey);
+
 async function handleHttp(req, res) {
   const origin = req.headers.origin;
   if (!loopbackHost(req.headers.host) || (origin && !localOrigin(origin))) {
     errorResponse(res, 403, "The gateway accepts only local requests");
     return;
   }
+  const path = req.url.split("?")[0];
+  if (isMonitorPath(path) && await serveMonitor(req, res, path)) return;
   if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
@@ -387,16 +464,7 @@ async function handleHttp(req, res) {
   // Health check
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "ok",
-        extensionConnected: !!extensionWs,
-        imageAttachments: extensionCapabilities.get(extensionWs)?.has("imageAttachments") ?? false,
-        conversationReuse: extensionCapabilities.get(extensionWs)?.has("conversationReuse") ?? false,
-        longMessageFallback: settings.textAttachmentFallback && (extensionCapabilities.get(extensionWs)?.has("longMessageFallback") ?? false),
-        pendingRequests: pending.size,
-      })
-    );
+    res.end(JSON.stringify(healthSnapshot()));
     return;
   }
 
@@ -405,15 +473,8 @@ async function handleHttp(req, res) {
     return;
   }
   if (req.method === "GET" && req.url === "/metrics") {
-    const percent = (part, total) => total ? Math.round(10_000 * part / total) / 100 : 0;
-    const textBytesSent = metrics.outgoingPromptBytes + metrics.textAttachmentBytes;
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ...metrics, pendingRequests: pending.size, browserBusy: !!activeRequest,
-      conversationReuseSuccessRate: percent(metrics.conversationReuseSuccesses, metrics.continuationRequests),
-      toolDefinitionReuseRate: percent(metrics.toolDefinitionReuses, metrics.toolDefinitionRequests),
-      redundantDataAvoidedPercent: percent(Math.max(0, metrics.fullContextBaselineBytes - textBytesSent), metrics.fullContextBaselineBytes),
-    }));
+    res.end(JSON.stringify(metricsSnapshot()));
     return;
   }
 
@@ -421,7 +482,7 @@ async function handleHttp(req, res) {
   if (req.method === "DELETE" && req.url?.startsWith("/v1/requests/")) {
     const requestId = req.url.split("/").pop();
     const had = pending.has(requestId);
-    cleanupRequest(requestId);
+    cleanupRequest(requestId, "client_cancelled");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ cancelled: had }));
     return;
@@ -429,13 +490,34 @@ async function handleHttp(req, res) {
 
   // OpenAI-compatible chat completions
   if (req.method === "POST" && req.url === "/v1/chat/completions") {
+    const requestId = randomUUID();
+    monitor.emit("request.received", requestId);
+    let observedCompletion;
+    if (monitor.enabled) {
+      res.once("finish", () => {
+        if (observedCompletion) {
+          const { scope, outputTokens, toolCalls } = observedCompletion;
+          monitor.callsForwarded(requestId, scope, toolCalls);
+          monitor.emit("request.completed", requestId, { estimatedOutputTokens: outputTokens }, "gateway", scope);
+        }
+        monitor.emit("response.client_finished", requestId);
+      });
+      res.once("close", () => {
+        if (res.writableFinished) return;
+        monitor.emit("request.cancelled", requestId, { code: "client_disconnected" });
+        monitor.emit("response.client_disconnected", requestId);
+      });
+    }
+    const failed = (code) => monitor.emit("request.failed", requestId, { code });
     if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
       req.resume();
       metrics.oversizedRequestCount++;
+      failed("context_length");
       errorResponse(res, 413, "Request body exceeds 32 MiB. Send fewer images or a smaller task context.", "context_length_exceeded");
       return;
     }
     let payload;
+    let incomingBytes;
     try {
       const chunks = [];
       let bytes = 0;
@@ -444,43 +526,52 @@ async function handleHttp(req, res) {
         if (bytes > MAX_BODY_BYTES) {
           req.resume();
           metrics.oversizedRequestCount++;
+          failed("context_length");
           errorResponse(res, 413, "Request body exceeds 32 MiB. Send fewer images or a smaller task context.", "context_length_exceeded");
           return;
         }
         chunks.push(chunk);
       }
       const body = Buffer.concat(chunks, bytes).toString("utf8");
+      incomingBytes = bytes;
       metrics.incomingRequestCharacters += body.length;
       metrics.incomingRequestBytes += bytes;
+      monitor.emit("request.input", requestId, { incomingBytes: bytes, incomingCharacters: body.length });
       payload = JSON.parse(body);
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Expected request object");
       }
     } catch {
       if (res.destroyed) return;
+      failed("invalid_json");
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid JSON" }));
       return;
     }
 
-    const requestId = randomUUID();
     let context;
     try {
       chatMessages(payload);
       context = clientContext(payload);
+      context.incomingBytes = incomingBytes;
     } catch (err) {
+      failed("invalid_request");
       errorResponse(res, 400, err.message, "invalid_request_error");
       return;
     }
     metrics.estimatedInputTokens += context.tokens;
+    if (monitor.enabled) monitor.emit("request.input", requestId, { logicalBytes: context.logicalBytes,
+      incomingMessages: payload.messages?.length ?? 0, estimatedInputTokens: context.tokens, model: safeModel(payload.model ?? "auto") });
     if (settings.maxContextTokens && context.tokens > settings.maxContextTokens) {
       metrics.oversizedRequestCount++;
+      failed("context_length");
       errorResponse(res, 413, `Client context is estimated at ${context.tokens} tokens and exceeds the configured ${settings.maxContextTokens}-token budget. Start a smaller task, compact the IDE history, or reduce the supplied files and tool output.`, "context_length_exceeded");
       return;
     }
 
     const socket = extensionWs;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
+      failed("extension_unavailable");
       res.writeHead(503, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
@@ -520,10 +611,12 @@ async function handleHttp(req, res) {
         const location = activeRequest?.requestId === requestId ? "ChatGPT response" : "an available browser tab";
         pending.delete(requestId);
         metrics.timedOut++;
+        monitor.emit("request.timed_out", requestId, { code: activeRequest?.requestId === requestId ? "browser_timeout" : "queue_timeout" });
         console.warn(`[gateway] Timed out waiting for ${location} for ${requestId}`);
         reject(new Error(`Timeout waiting for ${location}`));
       }, timeoutMs);
       pending.set(requestId, { socket, message, payload, context, resolve, reject, timer, onProgress, queuedAt: Date.now() });
+      monitor.emit("request.queued", requestId);
     });
 
     // The request body can finish while the client is still waiting for our reply.
@@ -543,6 +636,7 @@ async function handleHttp(req, res) {
       }
       if (!result.ok) {
         metrics.failed++;
+        failed(result.monitorCode === "extension_send" ? "extension_send" : browserError(result.errorCode, result.error));
         if (isOversizedError(result.errorCode)) {
           const message = typeof result.error === "string" ? result.error : "ChatGPT could not send the oversized draft";
           errorResponse(res, 413, `${message}. Send a smaller file selection, tool result, or task.`, "context_length_exceeded");
@@ -558,26 +652,37 @@ async function handleHttp(req, res) {
       let decoded;
       try {
         if (typeof result.content !== "string") throw new Error("ChatGPT did not return text content");
-        decoded = chat.decode(result.content);
+        decoded = chat.decode(result.content, monitor.enabled ? (event, name) =>
+          monitor.emit(event, requestId, { name: safeName(name) ?? "redacted" }) : undefined);
         if (streamed && !decoded.content?.startsWith(streamed)) {
           throw new Error("ChatGPT revised the streamed text. Retry for the complete reply.");
         }
       } catch (err) {
         metrics.failed++;
-        console.warn(`[gateway] Rejected browser reply for ${requestId}: ${err.message}`);
+        const code = streamed ? "revised_response" : chat.hasTools ? "invalid_tool_call" : "invalid_response";
+        failed(code);
+        console.warn(`[gateway] Rejected browser reply for ${requestId}: ${code}`);
         errorResponse(res, 502, err.message, streamed ? "revised_response" : "invalid_tool_call");
         return;
       }
+      monitor.emit("response.decoded", requestId);
       rememberConversation(message.model, result, decoded, chat.toolsKey);
-      if (result.continuedChat && result.continuedChat === conversationKey(result.url)) metrics.conversationReuseSuccesses++;
+      const scope = conversationKey(result.url);
+      if (result.continuedChat && result.continuedChat === scope) {
+        metrics.conversationReuseSuccesses++;
+        monitor.emit("context.reused", requestId);
+      }
       const outputTokens = estimateTokens(decoded.toolCalls ? JSON.stringify(decoded.toolCalls) : decoded.content);
       metrics.estimatedOutputTokens += outputTokens;
       const usage = { prompt_tokens: context.tokens, completion_tokens: outputTokens, total_tokens: context.tokens + outputTokens };
+      if (monitor.enabled) observedCompletion = { scope, outputTokens, toolCalls: (decoded.toolCalls ?? []).slice(0, 100)
+        .map(({ id, function: { name } }) => ({ id, name })) };
       sendCompletion(res, payload, completion, decoded, streamed, usage);
       metrics.completed++;
     } catch (err) {
       if (res.destroyed) return;
       metrics.failed++;
+      failed("browser_timeout");
       errorResponse(res, 504, err.message);
     }
     return;
@@ -603,6 +708,9 @@ function listener() {
 }
 
 const server = listener();
+if (monitor.enabled && monitor.config.persist) {
+  for (const signal of ["SIGINT", "SIGTERM"]) process.once(signal, () => monitor.close().finally(() => process.exit(0)));
+}
 server.listen(PORT, "127.0.0.1", () => {
   const { port } = server.address();
   const ipv6 = listener();

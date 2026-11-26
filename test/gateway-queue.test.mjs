@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { get as httpGet } from "node:http";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -22,6 +23,7 @@ async function startGateway(t, apiKey = "", settings = {}) {
       ...process.env, PORT: "0", CHATGPT_GATEWAY_API_KEY: apiKey,
       CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "0", CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS: "0",
       CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "true", CHATGPT_GATEWAY_INCLUDE_HISTORICAL_IMAGES: "true",
+      CHATGPT_GATEWAY_MONITOR_ENABLED: "true", CHATGPT_GATEWAY_MONITOR_PERSIST: "false",
       ...settings,
     },
   });
@@ -473,4 +475,122 @@ test("holds the browser slot through client cancellation and skips expired queue
   assert.equal(gateway.sent[1].messages[0].content, "Still pending");
   gateway.reply(1, "Correct reply");
   await assertReply(next, "Correct reply");
+});
+
+test("serves only known static monitor files and protects data, filters and exports", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t, "monitor-secret", { CHATGPT_GATEWAY_MONITOR_EXPORT_BYTES: "8192" });
+  const headers = { Authorization: "Bearer monitor-secret" };
+  const dashboard = await gateway.request("/dashboard");
+  assert.equal(dashboard.status, 200);
+  assert.match(dashboard.headers.get("content-security-policy"), /frame-ancestors 'none'/);
+  assert.equal(dashboard.headers.get("x-content-type-options"), "nosniff");
+  assert.match(await dashboard.text(), /Gateway Monitor/);
+  for (const file of ["app.js", "views.js", "api.js", "styles.css"]) {
+    assert.equal((await gateway.request(`/dashboard/assets/${file}`)).status, 200);
+  }
+  assert.equal((await gateway.request("/dashboard/assets/..%2f..%2fserver.mjs")).status, 404);
+  assert.equal((await gateway.request("/monitor/status")).status, 401);
+  assert.equal((await gateway.request("/monitor/status", { headers: { ...headers, Origin: "http://localhost:14" } })).status, 403);
+  const foreignHost = await new Promise((resolve, reject) => {
+    httpGet(gateway.base + "/monitor/status", { headers: { ...headers, Host: "example.invalid" } }, (response) => {
+      response.resume();
+      resolve(response.statusCode);
+    }).on("error", reject);
+  });
+  assert.equal(foreignHost, 403);
+  assert.equal((await gateway.request("/monitor/status", { method: "POST", headers })).status, 405);
+  for (const bad of ["limit=201", "limit=1&limit=2", "cursor=-1", "component=unknown", "from=invalid"]) {
+    assert.equal((await gateway.request(`/monitor/logs?${bad}`, { headers })).status, 400);
+  }
+  const first = await (await gateway.request("/monitor/logs?limit=1", { headers })).json();
+  assert.ok(first.nextCursor);
+  const second = await (await gateway.request(`/monitor/logs?limit=1&cursor=${first.nextCursor}`, { headers })).json();
+  assert.ok(second.items[0].sequence < first.items[0].sequence);
+  const wrong = await gateway.complete({ messages: false }, { headers });
+  assert.equal(wrong.status, 400);
+  const { items } = await (await gateway.request("/monitor/requests?state=failed", { headers })).json();
+  assert.equal(items[0].errorCode, "invalid_request");
+  const bundle = await gateway.request(`/monitor/export?requestId=${items[0].requestId}&format=jsonl`, { headers });
+  assert.equal(bundle.status, 200);
+  assert.match(bundle.headers.get("content-disposition"), /gateway-monitor\.jsonl/);
+  assert.equal(bundle.headers.get("cache-control"), "no-store");
+  const raw = await bundle.text();
+  assert.ok(Buffer.byteLength(raw) <= 8192);
+  assert.doesNotMatch(raw, /monitor-secret|Authorization/);
+  const lines = raw.trim().split("\n").map(JSON.parse);
+  assert.equal(lines[0].requests[0].requestId, items[0].requestId);
+  assert.ok(lines.length > 1);
+  assert.ok(lines.slice(1).every(({ requestId }) => requestId === items[0].requestId));
+  const filtered = await gateway.request("/monitor/export?event=request.failed&code=invalid_request", { headers });
+  assert.equal(filtered.status, 200);
+  assert.match(filtered.headers.get("content-disposition"), /gateway-monitor\.json"/);
+  const diagnostic = await filtered.json();
+  assert.equal(diagnostic.events.length, 1);
+  assert.equal(diagnostic.events[0].event, "request.failed");
+  assert.equal(diagnostic.requests[0].requestId, items[0].requestId);
+});
+
+test("links sanitized browser and tool events across a live HTTP and WebSocket fixture", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  gateway.send({ type: "hello", capabilities: ["conversationReuse", "imageAttachments", "continuationOnly", "contextMetrics", "telemetryV1"] });
+  await waitFor(async () => (await (await gateway.request("/monitor/status")).json()).capabilities.includes("telemetryV1"));
+  const user = { role: "user", content: "PRIVATE_INPUT source code 🖼\n" + "Earlier fixture output.\n".repeat(50) };
+  const tools = [{ type: "function", function: { name: "godot__get_godot_version", parameters: { type: "object" } } }];
+  const pending = gateway.complete({ messages: [user], tools, model: "PRIVATE_MODEL" });
+  await waitFor(() => gateway.sent.length === 1);
+  const { requestId, telemetry } = gateway.sent[0];
+  assert.equal(telemetry, 1);
+  const event = (name, data = {}) => ({ requestId, event: name, component: "content-script", data });
+  gateway.send({ type: "telemetry", version: 99, requestId, events: [event("browser.prompt_submitted")] });
+  gateway.send({ type: "telemetry", version: 1, requestId, events: [event("browser.prompt_submitted", { prompt: "PRIVATE_BROWSER" }),
+    event("attachment.attempted", { kind: "image", bytes: 10 }), event("attachment.accepted", { kind: "image", bytes: 10 }),
+    event("browser.prompt_submitted"), event("browser.generation_detected"), event("browser.response_received", { characters: 24 })] });
+  const prompt = gateway.sent[0].messages[0].content;
+  gateway.send({ type: "chat-transmission", requestId, promptCharacters: prompt.length, promptBytes: Buffer.byteLength(prompt),
+    images: 0, textBytes: 0, fallback: false });
+  const scope = { tabId: 91, url: "https://chatgpt.com/c/PRIVATE_BROWSER_URL" };
+  gateway.reply(0, JSON.stringify({ gateway_request_id: requestId,
+    tool_calls: [{ name: tools[0].function.name, arguments: { path: "PRIVATE_ARGUMENT" } }] }), scope);
+  const first = (await (await pending).json()).choices[0].message;
+  const result = { role: "tool", tool_call_id: first.tool_calls[0].id, content: "PRIVATE_RESULT" };
+  const continuation = gateway.complete({ model: "PRIVATE_MODEL", messages: [user, first, result], tools });
+  await waitFor(() => gateway.sent.length === 2);
+  const next = gateway.sent[1];
+  assert.equal(next.continuation.url, scope.url);
+  const delta = next.continuation.messages[0].content;
+  gateway.send({ type: "chat-transmission", requestId: next.requestId, promptCharacters: delta.length,
+    promptBytes: Buffer.byteLength(delta), images: 0, textBytes: 0, fallback: false });
+  gateway.reply(1, "PRIVATE_ASSISTANT", scope);
+  await assertReply(continuation, "PRIVATE_ASSISTANT");
+  const detail = await (await gateway.request(`/monitor/requests/${requestId}`)).json();
+  assert.equal(detail.request.state, "completed");
+  assert.equal(detail.request.fullTextBytes, Buffer.byteLength(prompt));
+  assert.equal(detail.request.forwardedTextBytes, Buffer.byteLength(prompt));
+  assert.ok(detail.timeline.some(({ event }) => event === "browser.generation_detected"));
+  assert.ok(detail.timeline.some(({ event }) => event === "response.client_finished"));
+  const context = await (await gateway.request("/monitor/conversations")).json();
+  assert.equal(context.items[0].sameChatObserved, true);
+  assert.ok(context.items[0].fullTextBytes > context.items[0].forwardedTextBytes);
+  const observed = await (await gateway.request("/monitor/tools")).json();
+  assert.equal(observed.items[0].result_received, 1);
+  assert.equal(observed.calls[0].resultRequestId, next.requestId);
+  const status = await (await gateway.request("/monitor/status")).json();
+  assert.equal(status.totals.completed, 2);
+  assert.equal(status.retention.rejectedExtensionEvents, 2);
+  for (const url of ["/monitor/logs", "/monitor/status", "/monitor/requests", "/monitor/tools", "/monitor/export"]) {
+    assert.doesNotMatch(await (await gateway.request(url)).text(), /PRIVATE_|call_[a-z0-9]{20,}|https:\/\/chatgpt.com/);
+  }
+});
+
+test("disabled monitor leaves the existing API operational", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_MONITOR_ENABLED: "false" });
+  assert.equal((await gateway.request("/dashboard")).status, 404);
+  assert.equal((await gateway.request("/monitor/status")).status, 404);
+  assert.equal((await gateway.request("/health")).status, 200);
+  gateway.send({ type: "hello", capabilities: ["telemetryV1"] });
+  const pending = gateway.chat("No monitor");
+  await waitFor(() => gateway.sent.length === 1);
+  assert.equal(gateway.sent[0].telemetry, undefined);
+  gateway.reply(0, "Normal response");
+  await assertReply(pending, "Normal response");
 });

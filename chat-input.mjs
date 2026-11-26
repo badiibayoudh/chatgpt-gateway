@@ -149,5 +149,8 @@ export function assembleTranscript(entries, { includeHistoricalImages = true, al
     });
     return { ...message, content: parts.join("\n") };
   });
-  return { transcript, attachments };
+  return { transcript, attachments, attachmentStats: {
+    images: attachments.length, historicalImages: attachments.length - currentImages.length, bytes,
+    skipped: entries.reduce((sum, entry) => sum + entry.attachments.length, 0) - attachments.length,
+  } };
 }
