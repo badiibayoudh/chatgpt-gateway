@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { prepareChat } from "../chat-tools.mjs";
+import { describeHistory, messageKey, newMessages, toolCallKeys } from "../chat-history.mjs";
 
 const requestId = "12345678-1234-1234-1234-123456789abc";
 const edit = {
@@ -20,6 +21,7 @@ const args = { filepath: "sample.py", changes: "def add(a, b):\n    return a + b
 const call = { name: edit.function.name, arguments: args };
 const user = { role: "user", content: "Fix the selected file" };
 const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=";
+const screenshotBytes = (index) => Buffer.concat([Buffer.from(png, "base64"), Buffer.from([index])]).toString("base64");
 
 function envelope(calls, id = requestId) {
   return JSON.stringify({ gateway_request_id: id, tool_calls: calls });
@@ -80,7 +82,7 @@ test("retains earlier text when its image exceeds the attachment allowance", () 
   const messages = Array.from({ length: 9 }, (_value, index) => ({
     role: "user", content: [
       { type: "text", text: `Screenshot description ${index}` },
-      { type: "image", mimeType: "image/png", data: png },
+      { type: "image", mimeType: "image/png", data: screenshotBytes(index) },
     ],
   }));
   const chat = prepareChat({ messages }, requestId);
@@ -94,7 +96,7 @@ test("retains earlier text when its image exceeds the attachment allowance", () 
 test("counts the latest Cline tool batch separately from earlier screenshot batches", () => {
   const result = (index) => [
     { role: "tool", tool_call_id: `screenshot-${index}`, content: `Screenshot description ${index}` },
-    { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] },
+    { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${screenshotBytes(index)}` } }] },
   ];
   const batch = (...indices) => [{
     role: "assistant", tool_calls: indices.map((index) => ({ id: `screenshot-${index}` })),
@@ -111,6 +113,75 @@ test("counts the latest Cline tool batch separately from earlier screenshot batc
 
   const oversized = batch(...Array.from({ length: 9 }, (_, index) => index));
   assert.throws(() => prepareChat({ messages: [user, ...oversized] }, requestId), /8 images and 20 MiB/);
+});
+
+test("retains the Mobile MCP screenshot and shares its upload with identical historical references", () => {
+  const shot = { type: "image", mimeType: "image/png", data: png };
+  const messages = [
+    { role: "tool", tool_call_id: "older-screenshot", content: [{ type: "text", text: "Earlier Mobile MCP screenshot" }, shot] },
+    { role: "assistant", content: "Earlier result" },
+    { role: "tool", tool_call_id: "current-screenshot", content: [shot] },
+  ];
+  const included = prepareChat({ messages }, requestId);
+  assert.deepEqual(included.attachments.map(({ name }) => name), ["image-2.png"]);
+  assert.match(included.messages[0].content, /Earlier Mobile MCP screenshot\\n\[Attached image: image-2.png\]/);
+  const excluded = prepareChat({ messages }, requestId, undefined, { includeHistoricalImages: false });
+  assert.deepEqual(excluded.attachments.map(({ name }) => name), ["image-2.png"]);
+  assert.match(excluded.messages[0].content, /Earlier Mobile MCP screenshot\\n\[Earlier image unavailable: image-1.png\]/);
+});
+
+test("keeps an unresolved screenshot when Cline appends a task resumption message", () => {
+  const messages = [user,
+    { role: "assistant", tool_calls: [{ id: "screenshot" }] },
+    { role: "tool", tool_call_id: "screenshot", content: "See the following image." },
+    { role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${png}` } }] },
+    { role: "user", content: "[TASK RESUMPTION] Please continue where you left off." },
+  ];
+  const chat = prepareChat({ messages }, requestId, undefined, { includeHistoricalImages: false });
+  assert.equal(chat.attachments.length, 1);
+  assert.match(chat.messages[0].content, /\[Attached image: image-1.png\]/);
+});
+
+test("a tool ID with changed arguments cannot establish continuation after compaction", () => {
+  const issued = { id: "gateway-call", type: "function", function: { name: "read_file", arguments: '{"path":"first"}' } };
+  const assistant = { role: "assistant", tool_calls: [issued] };
+  const previous = { keys: [messageKey(user), messageKey(assistant)],
+    calls: toolCallKeys([issued]), instructionsKey: describeHistory([]).instructionsKey };
+  const history = describeHistory([
+    { role: "user", content: "Compacted context" },
+    { ...assistant, tool_calls: [{ ...issued, function: { ...issued.function, arguments: '{"path":"second"}' } }] },
+    { role: "tool", tool_call_id: issued.id, content: "A tool result" },
+  ]);
+  assert.equal(newMessages(history, previous), null);
+});
+
+test("preserves text before and after a Mobile MCP image in its original order", () => {
+  const content = [
+    { type: "text", text: "Before\r\n    indented" },
+    { type: "image", mimeType: "image/png", data: png },
+    { type: "text", text: "After\n\tindented\n" },
+  ];
+  const { messages: [prompt] } = prepareChat({ messages: [{ role: "tool", content }] }, requestId);
+  assert.equal(JSON.parse(prompt.content.split("Conversation (JSON):\n\n")[1])[0].content,
+    "Before\r\n    indented\n[Attached image: image-1.png]\nAfter\n\tindented\n");
+});
+
+test("compact JSON preserves Godot MCP scene paths and Context7 documentation verbatim", () => {
+  const godot = { type: "function", function: {
+    name: "godot__get_project_info", description: "Inspect a Godot project.",
+    parameters: { type: "object", properties: { projectPath: { type: "string" } }, required: ["projectPath"] },
+  } };
+  const argumentsText = '{ "projectPath": "C:\\\\fixtures\\\\godot" }';
+  const docs = "Context7 excerpt\r\n\tvar scene = preload(\"res://scenes/Level.tscn\")\r\n\r\n    scene.instantiate()\n";
+  const messages = [user,
+    { role: "assistant", tool_calls: [{ id: "scene-call", function: { name: godot.function.name, arguments: argumentsText } }] },
+    { role: "tool", tool_call_id: "scene-call", content: "{\"root\":\"Node2D\",\"children\":[\"Camera2D\"]}" },
+    { role: "tool", tool_call_id: "context7-call", content: docs },
+  ];
+  const { messages: [prompt] } = prepareChat({ messages, tools: [godot] }, requestId);
+  const [instructions, transcript] = prompt.content.split("Conversation (JSON):\n\n");
+  assert.equal(transcript, JSON.stringify(messages));
+  assert.ok(instructions.includes(`Available client functions (JSON):\n${JSON.stringify([godot.function])}\n`));
 });
 
 test("passes the system prompt, selected source, prior function call and tool result", () => {

@@ -6,7 +6,8 @@ import { runInNewContext } from "node:vm";
 const script = await readFile(new URL("../background.js", import.meta.url), "utf8");
 const target = { id: 7, url: "https://chatgpt.com/c/fixture" };
 
-async function relay(tabs, { changed = false, tooLong = false, retryError, draftUrl, useContinuation = true } = {}) {
+async function relay(tabs, { changed = false, tooLong = false, retryError, draftUrl, useContinuation = true,
+  fallback = true, quota = false } = {}) {
   let socket;
   const prompts = [];
   const reopened = [];
@@ -19,7 +20,7 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
   }
   const event = { addListener() {} };
   runInNewContext(script, {
-    WebSocket, setInterval: () => 1, clearInterval() {},
+    WebSocket, TextEncoder, setInterval: () => 1, clearInterval() {},
     console: { log() {} },
     chrome: {
       alarms: { create() {}, onAlarm: event },
@@ -34,6 +35,7 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
           if (message.type === "ping") return { ok: true, url: target.url };
           prompts.push({ id, message });
           if (changed && message.expectedConversation) return { ok: false, conversationChanged: true };
+          if (quota) return { ok: false, errorCode: "chatgpt_upload_allowance", error: "Upload allowance reached" };
           if (draftUrl && prompts.length === 1) {
             return { ok: false, errorCode: "chatgpt_draft_blocked", error: "Send stayed disabled", retryDraftUrl: draftUrl };
           }
@@ -48,6 +50,7 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
   await socket.onmessage({ data: JSON.stringify({
     type: "chat",
     requestId: "request",
+    textAttachmentFallback: fallback,
     messages: [{ role: "user", content: "Full transcript" }],
     attachments: [{ name: "image-1.png", mimeType: "image/png", data: "fixture" }],
     continuation: useContinuation ? {
@@ -57,7 +60,8 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
       attachments: [{ name: "new-screenshot.png", mimeType: "image/png", data: "new" }],
     } : undefined,
   }) });
-  return { prompts, replies, reopened };
+  return { prompts, replies: replies.filter(({ type }) => type === "response"), reopened,
+    transmissions: replies.filter(({ type }) => type === "chat-transmission") };
 }
 
 test("sends only the new turn to the matching tab even when another tab is listed first", async () => {
@@ -87,7 +91,7 @@ test("does not send the full transcript if the user navigates during a continuat
 });
 
 test("attaches only the oversized new turn and its images in the same chat", async () => {
-  const { prompts, replies } = await relay([target], { tooLong: true });
+  const { prompts, replies, transmissions } = await relay([target], { tooLong: true });
   assert.equal(prompts.length, 2);
   assert.equal(prompts[0].message.userMessage, "New turn only");
   const { message } = prompts[1];
@@ -99,6 +103,20 @@ test("attaches only the oversized new turn and its images in the same chat", asy
     name: "gateway-request-request.txt", mimeType: "text/plain", text: "New turn only",
   });
   assert.equal(replies[0].ok, true);
+  assert.equal(transmissions[1].fallback, true);
+  assert.equal(transmissions[1].textBytes, Buffer.byteLength("New turn only"));
+});
+
+test("returns context or quota errors without sending an automatic attachment", async () => {
+  for (const [options, code] of [
+    [{ tooLong: true, fallback: false }, "chatgpt_input_too_long"],
+    [{ quota: true }, "chatgpt_upload_allowance"],
+  ]) {
+    const { prompts, replies, transmissions } = await relay([target], options);
+    assert.equal(prompts.length, 1);
+    assert.equal(replies[0].errorCode, code);
+    assert.equal(transmissions[0].fallback, false);
+  }
 });
 
 test("returns the rejection when ChatGPT also rejects the attachment retry", async () => {

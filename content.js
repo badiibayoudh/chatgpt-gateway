@@ -39,6 +39,7 @@
     'form[data-chatgpt-composer] button[aria-label*="beenden" i]',
   ].join(", ");
   const INPUT_TOO_LONG = /(?:die nachricht ist|deine (?:gesendete nachricht war|gesendeten nachrichten waren)) zu lang|(?:the |this |your )?(?:submitted )?messages? (?:you (?:submitted|sent) )?(?:was|were|is|are) too long/i;
+  const UPLOAD_ALLOWANCE = /(?:file[ -])?upload (?:limit|quota|allowance)\b.{0,80}(?:reach|exceed)|(?:reach|exceed)\w*.{0,80}(?:file[ -])?upload (?:limit|quota|allowance)|out of (?:file )?uploads|no (?:file )?uploads? (?:left|remaining)|too many (?:file )?uploads|upload[- ]?(?:limit|kontingent).{0,80}(?:erreicht|überschritten|aufgebraucht)|(?:limit|kontingent) für (?:datei[- ])?uploads.{0,80}(?:erreicht|überschritten|aufgebraucht)|keine (?:datei[- ])?uploads mehr/i;
   const RETRY_LABEL = /^(?:retry|try again|erneut versuchen)$/i;
 
   // ── Helpers ──────────────────────────────────────────────
@@ -62,7 +63,6 @@
             const rect = el.getBoundingClientRect();
 
             if (rect.width > 0 && rect.height > 0) {
-                console.log("[Gateway] Input found:", selector);
                 return el;
             }
         }
@@ -134,10 +134,11 @@
     );
   }
 
-  function oversizedNotices() {
+  function platformNotices(pattern) {
     const notices = new Set();
-    for (const alert of document.querySelectorAll('[role="alert"], [data-testid*="error"]')) {
-      if (INPUT_TOO_LONG.test(alert.textContent) && alert.getClientRects().length) notices.add(alert);
+    for (const alert of document.querySelectorAll('[role="alert"], [data-testid*="error"], [role="status"], [data-sonner-toast], [data-testid*="toast"], [aria-live="assertive"], [role="tooltip"]')) {
+      if (alert.getClientRects().length && !alert.closest?.('[data-message-author-role], .markdown') &&
+        pattern.test(alert.textContent.replace(/\s+/g, " "))) notices.add(alert);
     }
     // The inline error can be a plain container with a retry button.
     for (const button of document.querySelectorAll('main button, main [role="button"]')) {
@@ -145,7 +146,7 @@
         button.closest('[data-message-author-role], .markdown')) continue;
       let container = button.parentElement;
       for (let depth = 0; container && container.tagName !== "MAIN" && depth < 3; depth++) {
-        if (INPUT_TOO_LONG.test(container.textContent)) {
+        if (pattern.test(container.textContent.replace(/\s+/g, " "))) {
           notices.add(container);
           break;
         }
@@ -153,6 +154,12 @@
       }
     }
     return notices;
+  }
+
+  function uploadAllowanceError() {
+    const error = new Error("ChatGPT reports that its upload allowance was reached. Wait for the allowance to reset or send a request without attachments.");
+    error.code = "chatgpt_upload_allowance";
+    return error;
   }
 
   // ── Actions ──────────────────────────────────────────────
@@ -297,6 +304,7 @@
     if (!composer()) throw new Error("Cannot find the ChatGPT attachment composer");
     const uploadDeadline = Date.now() + 45_000;
     for (const attachment of attachments) {
+      if (platformNotices(UPLOAD_ALLOWANCE).size) throw uploadAllowanceError();
       const previous = attachmentCounts(composer(), attachment.name);
       const fileInput = () => document.querySelector('#upload-files[type="file"]') ||
         composer()?.querySelector('input[type="file"]');
@@ -325,6 +333,7 @@
       let confirmed = false;
       while (Date.now() < deadline) {
         await sleep(250);
+        if (platformNotices(UPLOAD_ALLOWANCE).size) throw uploadAllowanceError();
         if (!findSendButton()) continue;
         const current = attachmentCounts(composer(), attachment.name);
         if (current.named > previous.named || current.composer > previous.composer) {
@@ -354,9 +363,10 @@
     return error;
   }
 
-  async function clickSend(text) {
+  async function clickSend(text, hasAttachments) {
     // Wait a moment for the send button to become enabled
     for (let i = 0; i < 10; i++) {
+      if (hasAttachments && platformNotices(UPLOAD_ALLOWANCE).size) throw uploadAllowanceError();
       const btn = findSendButton();
       if (btn) {
         btn.click();
@@ -374,14 +384,17 @@
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(previousTurns, previousNotices, onProgress) {
+  async function waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress) {
     const deadline = Date.now() + MAX_WAIT;
     let lastTurnId = null;
     let lastText = "";
     let stableCount = 0;
 
     while (Date.now() < deadline) {
-      if (!lastText && [...oversizedNotices()].some((notice) => !previousNotices.has(notice))) {
+      if (!lastText && [...platformNotices(UPLOAD_ALLOWANCE)].some((notice) => !previousUploadNotices.has(notice))) {
+        throw uploadAllowanceError();
+      }
+      if (!lastText && [...platformNotices(INPUT_TOO_LONG)].some((notice) => !previousNotices.has(notice))) {
         const error = new Error("ChatGPT rejected the submission because its messages were too long");
         error.code = "chatgpt_input_too_long";
         throw error;
@@ -440,9 +453,10 @@
       const previousTurns = new Set(
         Array.from(findAssistantMessages(), (message) => getTurnId(getAssistantTurn(message)))
       );
-      const previousNotices = oversizedNotices();
+      const previousNotices = platformNotices(INPUT_TOO_LONG);
+      const previousUploadNotices = platformNotices(UPLOAD_ALLOWANCE);
       draftUrl = window.location.href;
-      await clickSend(msg.userMessage);
+      await clickSend(msg.userMessage, msg.attachments?.length);
 
       let streamed = "";
       const onProgress = msg.streamText ? (content) => {
@@ -450,7 +464,7 @@
         streamed = content;
         chrome.runtime.sendMessage({ type: "chat-progress", requestId: msg.requestId, content }).catch(() => {});
       } : undefined;
-      const response = await waitForNewResponse(previousTurns, previousNotices, onProgress);
+      const response = await waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress);
 
       if (conversationChanged()) throw new Error("ChatGPT conversation changed after submitting the prompt");
       return { ok: true, content: response, url: window.location.href };
@@ -474,5 +488,5 @@
     }
   });
 
-  console.log("[ChatGPT Gateway] Content script loaded on", window.location.href);
+  console.log("[ChatGPT Gateway] Content script loaded");
 })();

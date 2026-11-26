@@ -10,7 +10,7 @@ const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwM
 async function runAttachmentTurn(uploadSucceeds, {
   attachment = { name: "image-1.png", mimeType: "image/png", data: png }, tooLong = false, alertText,
   uploadLabel, localizedSend = false, ariaDisabled = false, existingPreview = false,
-  userMessage = "Inspect the screenshot", inlineLimit = Infinity, draftTooltip,
+  userMessage = "Inspect the screenshot", inlineLimit = Infinity, draftTooltip, quotaAlert,
 } = {}) {
   let receive;
   let now = 0;
@@ -85,6 +85,9 @@ async function runAttachmentTurn(uploadSucceeds, {
         }
         if (selector.startsWith('[role="alert"]') && submitted && alertText) {
           return [{ textContent: alertText, getClientRects: () => [{}] }];
+        }
+        if (selector.startsWith('[role="alert"]') && uploaded && quotaAlert) {
+          return [{ textContent: quotaAlert, getClientRects: () => [{}] }];
         }
         if (selector.startsWith('[role="tooltip"]') && send.disabled && draftTooltip) {
           return [{ textContent: draftTooltip, getClientRects: () => [{}] }];
@@ -185,4 +188,12 @@ test("fails an unconfirmed upload without submitting a text-only turn", async ()
   assert.equal(response.ok, false);
   assert.match(response.error, /did not confirm upload/);
   assert.equal(submitted, false);
+});
+
+test("reports visible English and German upload allowance notices without submitting the draft", async () => {
+  for (const quotaAlert of ["You’ve reached your file upload limit.", "Du hast das Upload-Limit erreicht."]) {
+    const { response, submitted } = await runAttachmentTurn(true, { quotaAlert });
+    assert.equal(response.errorCode, "chatgpt_upload_allowance");
+    assert.equal(submitted, false);
+  }
 });

@@ -4,6 +4,7 @@
 
 const GATEWAY_URL = "ws://localhost:18790/ws";
 const HEARTBEAT_INTERVAL = 20_000;
+const utf8 = new TextEncoder();
 let ws = null;
 let reconnectTimer = null;
 const streamingRequests = new Map();
@@ -27,7 +28,10 @@ function connect() {
 
   socket.onopen = () => {
     log("Connected to gateway server");
-    sendToServer(socket, { type: "hello", capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly"] });
+    sendToServer(socket, {
+      type: "hello",
+      capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics"],
+    });
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
       reconnectTimer = null;
@@ -155,21 +159,33 @@ async function handleChatMessage(msg, socket) {
   for (const tab of candidates) {
     try {
       if (msg.streamText) streamingRequests.set(msg.requestId, { socket, tabId: tab.id });
-      const send = (text, files, newConversation, expectedDraftUrl) => chrome.tabs.sendMessage(tab.id, {
-        type: "chat",
-        requestId: msg.requestId,
-        model: msg.model,
-        userMessage: text,
-        attachments: files,
-        streamText: msg.streamText,
-        newConversation,
-        expectedConversation,
-        expectedDraftUrl,
-      });
+      const send = async (text, files, newConversation, expectedDraftUrl, fallback = false) => {
+        const response = await chrome.tabs.sendMessage(tab.id, {
+          type: "chat",
+          requestId: msg.requestId,
+          model: msg.model,
+          userMessage: text,
+          attachments: files,
+          streamText: msg.streamText,
+          newConversation,
+          expectedConversation,
+          expectedDraftUrl,
+        });
+        if (!response.conversationChanged) {
+          sendToServer(socket, {
+            type: "chat-transmission", requestId: msg.requestId,
+            promptCharacters: text.length, promptBytes: utf8.encode(text).byteLength,
+            images: files?.filter(({ mimeType }) => mimeType.startsWith("image/")).length ?? 0,
+            textBytes: fallback ? utf8.encode(userMessage).byteLength : 0, fallback,
+          });
+        }
+        return response;
+      };
       const newConversation = !continuation && msg.newConversation !== false;
       let response = await send(userMessage, attachments, newConversation);
       if (response.conversationChanged) throw new Error("ChatGPT navigated away from the task chat. Retry to reopen it.");
-      if (response.errorCode === "chatgpt_input_too_long" || response.errorCode === "chatgpt_draft_blocked") {
+      const oversized = response.errorCode === "chatgpt_input_too_long" || response.errorCode === "chatgpt_draft_blocked";
+      if (msg.textAttachmentFallback !== false && oversized) {
         const name = `gateway-request-${msg.requestId.slice(0, 8)}.txt`;
         const draftUrl = response.retryDraftUrl;
         const reason = response.error;
@@ -177,14 +193,12 @@ async function handleChatMessage(msg, socket) {
           ...(draftUrl ? [] : attachments ?? []),
           { name, mimeType: "text/plain", text: userMessage },
         ];
+        const instruction = `Read ${name} as the original request for this turn. Use the conversation, tool definitions, and response format specified there. Reply to the latest message or tool result. If that request calls for gateway_request_id, use ${msg.requestId}.`;
         let retry;
         try {
-          retry = await send(
-            `Read ${name} as the original request for this turn. Use the conversation, tool definitions, and response format specified there. Reply to the latest message or tool result. If that request calls for gateway_request_id, use ${msg.requestId}.`,
-            files,
-            !draftUrl && newConversation,
-            draftUrl,
-          );
+          retry = msg.maxPromptBytes && utf8.encode(instruction).byteLength > msg.maxPromptBytes
+            ? { ok: false, error: "The fallback prompt exceeds the configured byte limit", errorCode: response.errorCode }
+            : await send(instruction, files, !draftUrl && newConversation, draftUrl, true);
         } catch (err) {
           retry = { ok: false, error: err.message };
         }
@@ -201,6 +215,7 @@ async function handleChatMessage(msg, socket) {
         content: response.content || "",
         error: response.error || "",
         errorCode: response.errorCode,
+        oversized,
         tabId: tab.id,
         url: response.url,
       });

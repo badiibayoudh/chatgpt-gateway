@@ -14,17 +14,23 @@ export function messageKey({ role, content, tool_calls, tool_call_id, name }) {
   if (Array.isArray(content) && content.every((part) => part?.type === "text")) {
     content = content.map((part) => part.text).join("\n");
   }
-  const calls = Array.isArray(tool_calls) && tool_calls.length ? tool_calls.map((call) => {
-    const fn = call?.function;
-    let args = fn?.arguments;
-    if (typeof args === "string") {
-      try { args = JSON.parse(args); } catch { /* Keep the original arguments. */ }
-    }
-    return { id: call?.id, name: fn?.name, args };
-  }) : undefined;
+  const calls = Array.isArray(tool_calls) && tool_calls.length ? tool_calls.map(toolCallSignature) : undefined;
   return valueKey({
     role, content: content ?? "", calls, tool_call_id, name,
   });
+}
+
+function toolCallSignature(call) {
+  const fn = call?.function;
+  let args = fn?.arguments;
+  if (typeof args === "string") {
+    try { args = JSON.parse(args); } catch { /* Keep the original arguments. */ }
+  }
+  return { id: call?.id, name: fn?.name, args };
+}
+
+export function toolCallKeys(calls = []) {
+  return new Map(calls.map((call) => [call.id, valueKey(toolCallSignature(call))]));
 }
 
 export function describeHistory(messages = []) {
@@ -37,22 +43,46 @@ export function describeHistory(messages = []) {
   return { conversation, instructions, keys: conversation.map(messageKey), instructionsKey: valueKey(instructions) };
 }
 
+function findToolAnchor(conversation, expected) {
+  if (!expected.size) return null;
+  let first = 0;
+  let seen = new Set();
+  for (const [index, { role, tool_calls: calls }] of conversation.entries()) {
+    if (role !== "assistant" || !Array.isArray(calls) || !calls.length ||
+      calls.some((call) => !expected.has(call?.id) || expected.get(call.id) !== valueKey(toolCallSignature(call)))) {
+      seen.clear();
+      continue;
+    }
+    if (!seen.size) first = index;
+    for (const call of calls) seen.add(call.id);
+    if (seen.size === expected.size) return { first, end: index + 1 };
+  }
+  return null;
+}
+
 export function newMessages(history, previous) {
   const { conversation, instructions, keys, instructionsKey } = history;
-  let anchor = -1;
-  if (keys.length > previous.keys.length && previous.keys.every((key, index) => keys[index] === key)) {
-    anchor = previous.keys.length - 1;
-  } else if (previous.callIds.length) {
-    // A gateway-issued call ID survives Cline's serialization and history compaction.
-    anchor = conversation.findLastIndex(({ role, tool_calls }) => role === "assistant" &&
-      Array.isArray(tool_calls) && tool_calls.length === previous.callIds.length &&
-      previous.callIds.every((id) => tool_calls.some((call) => call?.id === id)));
-  }
-  if (anchor === -1) return null;
-  const suffix = conversation.slice(anchor + 1);
+  const exact = keys.length > previous.keys.length && previous.keys.every((key, index) => keys[index] === key);
+  const anchor = exact
+    ? { first: previous.keys.length - 1, end: previous.keys.length }
+    : findToolAnchor(conversation, previous.calls);
+  if (!anchor) return null;
+  const suffix = conversation.slice(anchor.end);
+  if (!exact && suffix.some(({ role }) => role === "assistant")) return null;
   if (!suffix.some(({ role }) => role === "user" || role === "tool")) return null;
-  const priorCall = previous.callIds.length && suffix[0].role === "tool" ? [conversation[anchor]] : [];
-  return [...(instructionsKey === previous.instructionsKey ? [] : instructions), ...priorCall, ...suffix];
+  let hasToolResults = false;
+  for (const message of suffix) {
+    if (message.role === "assistant") break;
+    if (message.role !== "tool") continue;
+    if (!previous.calls.has(message.tool_call_id)) return null;
+    hasToolResults = true;
+  }
+  const priorCalls = hasToolResults ? conversation.slice(anchor.first, anchor.end) : [];
+  return {
+    reason: exact ? "exact_history" : "verified_tool_anchor",
+    strong: previous.calls.size > 0,
+    messages: [...(instructionsKey === previous.instructionsKey ? [] : instructions), ...priorCalls, ...suffix],
+  };
 }
 
 export function conversationKey(url) {

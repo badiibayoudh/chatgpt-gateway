@@ -15,10 +15,15 @@ async function waitFor(check) {
   assert.fail("Timed out waiting for the gateway state");
 }
 
-async function startGateway(t, apiKey = "") {
+async function startGateway(t, apiKey = "", settings = {}) {
   const server = fileURLToPath(new URL("../server.mjs", import.meta.url));
   const child = spawn(process.execPath, [server], {
-    env: { ...process.env, PORT: "0", CHATGPT_GATEWAY_API_KEY: apiKey },
+    env: {
+      ...process.env, PORT: "0", CHATGPT_GATEWAY_API_KEY: apiKey,
+      CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "0", CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS: "0",
+      CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "true", CHATGPT_GATEWAY_INCLUDE_HISTORICAL_IMAGES: "true",
+      ...settings,
+    },
   });
   t.after(() => child.kill());
   const port = await new Promise((resolve, reject) => {
@@ -54,6 +59,11 @@ async function startGateway(t, apiKey = "") {
 
   return {
     base, sent, send, request, complete,
+    async stop() {
+      const exited = once(child, "exit");
+      child.kill();
+      await exited;
+    },
     async reconnectBrowser(capabilities) {
       const closed = once(browser, "close");
       browser.terminate();
@@ -109,7 +119,9 @@ test("reports ChatGPT’s input-size rejection to the client", { timeout: 10000 
   });
   const response = await request;
   assert.equal(response.status, 413);
-  assert.match((await response.json()).error, /ChatGPT rejected/);
+  const { error } = await response.json();
+  assert.equal(error.code, "context_length_exceeded");
+  assert.match(error.message, /ChatGPT rejected/);
 });
 
 test("reuses the browser conversation for matching history and starts fresh for a new task", { timeout: 10000 }, async (t) => {
@@ -134,6 +146,7 @@ test("reuses the browser conversation for matching history and starts fresh for 
     ...browser, messages: [messages.at(-1)], attachments: [],
   });
   assert.match(gateway.sent[1].messages[0].content, /Start the task/);
+  assert.equal(gateway.sent[1].newConversation, true); // A legacy full-history fallback must start a fresh browser chat.
   gateway.reply(1, "Second reply", browser);
   await assertReply(second, "Second reply");
 
@@ -162,7 +175,10 @@ test("resumes a compacted Cline task and prepares only the new screenshot and to
   await waitFor(() => gateway.sent.length === 1);
   const { requestId } = gateway.sent[0];
   gateway.reply(0, JSON.stringify({
-    gateway_request_id: requestId, tool_calls: [{ name: "read_file", arguments: { path: "fixture.txt" } }],
+    gateway_request_id: requestId, tool_calls: [
+      { name: "read_file", arguments: { path: "fixture.txt" } },
+      { name: "read_file", arguments: { path: "second.txt" } },
+    ],
   }), firstChat);
   const response = await first;
   assert.equal(response.status, 200);
@@ -182,7 +198,8 @@ test("resumes a compacted Cline task and prepares only the new screenshot and to
     { type: "text", text: "Older compacted history " + "z".repeat(250_000) },
     { type: "image_url", image_url: { url: "https://example.invalid/historical-image.png" } },
   ] };
-  const messages = [system, history, assistant, result, screenshot];
+  const splitCalls = assistant.tool_calls.map((call) => ({ ...assistant, tool_calls: [call] }));
+  const messages = [system, history, ...splitCalls, result, screenshot];
   const resumed = gateway.complete({ messages, tools });
   await waitFor(() => gateway.sent.length === 3);
   const { continuation } = gateway.sent[2];
@@ -193,7 +210,7 @@ test("resumes a compacted Cline task and prepares only the new screenshot and to
   assert.doesNotMatch(prompt, /System instructions supplied once|Original tool catalog|Older compacted history/);
   const transcript = JSON.parse(prompt.split("Conversation (JSON):\n\n")[1]);
   const name = `image-${gateway.sent[2].requestId.slice(0, 8)}-1.png`;
-  assert.deepEqual(transcript, [assistant, result, { role: "user", content: `[Attached image: ${name}]` }]);
+  assert.deepEqual(transcript, [...splitCalls, result, { role: "user", content: `[Attached image: ${name}]` }]);
   assert.deepEqual(continuation.attachments, [{ name, mimeType: "image/png", data: png }]);
   gateway.reply(2, "First task resumed", firstChat);
   await assertReply(resumed, "First task resumed");
@@ -212,6 +229,33 @@ test("resumes a compacted Cline task and prepares only the new screenshot and to
   assert.deepEqual(updated.attachments, []);
   gateway.reply(3, "Follow-up reply", firstChat);
   await assertReply(next, "Follow-up reply");
+  const stats = await (await gateway.request("/metrics")).json();
+  assert.equal(stats.historyMatches.verified_tool_anchor, 1);
+  assert.equal(stats.historyMatches.exact_history, 1);
+  assert.equal(stats.continuationRequests, 2);
+  assert.equal(stats.conversationReuseSuccessRate, 100);
+  assert.equal(stats.toolDefinitionReuses, 1);
+  assert.ok(stats.redundantDataAvoidedPercent > 0);
+});
+
+test("refuses to reuse either browser chat when two task histories match equally", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  const user = { role: "user", content: "Repeated initial message" };
+  for (const [index, url] of ["https://chatgpt.com/c/first", "https://chatgpt.com/c/second"].entries()) {
+    const started = gateway.complete({ messages: [user], new_conversation: true });
+    await waitFor(() => gateway.sent.length === index + 1);
+    gateway.reply(index, "Repeated reply", { tabId: 7, url });
+    await assertReply(started, "Repeated reply");
+  }
+  const next = gateway.complete({ new_conversation: false, messages: [
+    user, { role: "assistant", content: "Repeated reply" }, { role: "user", content: "Which task?" },
+  ] });
+  await waitFor(() => gateway.sent.length === 3);
+  assert.equal(gateway.sent[2].continuation, undefined);
+  assert.equal(gateway.sent[2].newConversation, true);
+  gateway.reply(2, "Fresh browser context");
+  await assertReply(next, "Fresh browser context");
+  assert.equal((await (await gateway.request("/metrics")).json()).historyMatches.ambiguous, 1);
 });
 
 test("round-trips a screenshot tool call, its MCP image result, and the final reply", { timeout: 10000 }, async (t) => {
@@ -269,7 +313,8 @@ test("round-trips a screenshot tool call, its MCP image result, and the final re
 
 test("streams plain text before completion without duplicating the result", { timeout: 10000 }, async (t) => {
   const gateway = await startGateway(t);
-  const pending = gateway.complete({ messages: [{ role: "user", content: "Stream a reply" }], stream: true });
+  const pending = gateway.complete({ messages: [{ role: "user", content: "Stream a reply" }], stream: true,
+    stream_options: { include_usage: true } });
   await waitFor(() => gateway.sent.length === 1);
   assert.equal(gateway.sent[0].streamText, true);
   gateway.send({ type: "progress", requestId: gateway.sent[0].requestId, content: "Starting" });
@@ -285,7 +330,103 @@ test("streams plain text before completion without duplicating the result", { ti
     rest += new TextDecoder().decode(value);
   }
   assert.equal(JSON.parse(rest.split("\n\n")[0].slice(6)).choices[0].delta.content, " now");
+  const usage = rest.split("\n\n").slice(0, 3).map((frame) => JSON.parse(frame.slice(6)))[2];
+  assert.deepEqual(usage.choices, []);
+  assert.ok(usage.usage.prompt_tokens > 0 && usage.usage.completion_tokens > 0);
+  assert.equal(usage.usage.total_tokens, usage.usage.prompt_tokens + usage.usage.completion_tokens);
   assert.match(rest, /data: \[DONE\]/);
+});
+
+test("reports logical usage and actual UTF-8 browser transmission without exposing text", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  gateway.send({ type: "hello", capabilities: ["imageAttachments", "contextMetrics"] });
+  await waitFor(async () => (await (await gateway.request("/health")).json()).imageAttachments);
+  const text = "Résumé 🖼 fixture private marker <|endoftext|>";
+  const payload = { messages: [{ role: "user", content: text }] };
+  const body = JSON.stringify(payload);
+  const pending = gateway.complete(payload);
+  await waitFor(() => gateway.sent.length === 1);
+  const { requestId } = gateway.sent[0];
+  gateway.send({ type: "chat-transmission", requestId, promptCharacters: text.length,
+    promptBytes: Buffer.byteLength(text), images: 1, textBytes: 0 });
+  gateway.send({ type: "chat-transmission", requestId, promptCharacters: 9, promptBytes: 9,
+    images: 0, textBytes: Buffer.byteLength(text), fallback: true });
+  gateway.reply(0, "Resolved.");
+  const { usage } = await (await pending).json();
+  assert.ok(usage.prompt_tokens > 0 && usage.completion_tokens > 0);
+  assert.equal(usage.total_tokens, usage.prompt_tokens + usage.completion_tokens);
+  const stats = await (await gateway.request("/metrics")).json();
+  assert.equal(stats.incomingRequestCharacters, body.length);
+  assert.equal(stats.incomingRequestBytes, Buffer.byteLength(body));
+  assert.equal(stats.outgoingPromptBytes, Buffer.byteLength(text) + 9);
+  assert.equal(stats.estimatedInputTokens, usage.prompt_tokens);
+  assert.equal(stats.estimatedOutputTokens, usage.completion_tokens);
+  assert.equal(stats.imageAttachmentCount, 1);
+  assert.equal(stats.textAttachmentFallbackCount, 1);
+  assert.equal(stats.oversizedRequestCount, 1);
+  assert.equal(stats.fullHistoryRequests, 1);
+  assert.ok(!JSON.stringify(stats).includes("fixture private marker"));
+});
+
+test("enforces browser byte and client token budgets before dispatch", { timeout: 10000 }, async (t) => {
+  for (const [setting, reason] of [
+    ["CHATGPT_GATEWAY_MAX_PROMPT_BYTES", /Browser prompt exceeds/],
+    ["CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS", /token budget/],
+  ]) {
+    const gateway = await startGateway(t, "", { [setting]: "10" });
+    const response = await gateway.complete({ messages: [
+      { role: "system", content: "This system instruction and the tool data must remain intact." },
+      { role: "user", content: "Inspect an entire file." },
+      { role: "tool", tool_call_id: "read", content: "A large current tool result.\n".repeat(200) },
+    ] });
+    assert.equal(response.status, 413);
+    const { error } = await response.json();
+    assert.equal(error.code, "context_length_exceeded");
+    assert.match(error.message, reason);
+    assert.equal(gateway.sent.length, 0);
+    assert.equal((await (await gateway.request("/metrics")).json()).oversizedRequestCount, 1);
+  }
+  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "4" });
+  const response = await gateway.complete({ messages: [{ role: "user", content: [
+    { type: "text", text: "ééé" },
+  ] }] });
+  assert.equal(response.status, 413);
+  assert.equal(gateway.sent.length, 0);
+});
+
+test("enforces disabled text fallback and reports platform upload allowance as 429", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "false" });
+  assert.equal((await gateway.chat("Older extension")).status, 503);
+  gateway.send({ type: "hello", capabilities: ["attachmentPolicy", "conversationReuse"] });
+  await waitFor(async () => (await (await gateway.request("/health")).json()).conversationReuse);
+  const pending = gateway.chat("Upload allowance fixture");
+  await waitFor(() => gateway.sent.length === 1);
+  assert.equal(gateway.sent[0].textAttachmentFallback, false);
+  gateway.reply(0, "", { ok: false, errorCode: "chatgpt_upload_allowance", error: "Upload allowance reached" });
+  const response = await pending;
+  assert.equal(response.status, 429);
+  assert.equal((await response.json()).error.code, "upload_allowance_exceeded");
+});
+
+test("a gateway restart starts fresh when the browser chat identity is no longer tracked", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  const initial = { role: "user", content: "Earlier task" };
+  const first = gateway.complete({ messages: [initial] });
+  await waitFor(() => gateway.sent.length === 1);
+  gateway.reply(0, "Earlier reply", { tabId: 7, url: "https://chatgpt.com/c/fixture" });
+  await assertReply(first, "Earlier reply");
+  await gateway.stop();
+  const restarted = await startGateway(t);
+  const next = restarted.complete({ new_conversation: false, messages: [
+    initial, { role: "assistant", content: "Earlier reply" }, { role: "user", content: "Resume this task" },
+  ] });
+  await waitFor(() => restarted.sent.length === 1);
+  assert.equal(restarted.sent[0].continuation, undefined);
+  assert.equal(restarted.sent[0].newConversation, true);
+  assert.match(restarted.sent[0].messages[0].content, /Earlier reply/);
+  restarted.reply(0, "Resumed with supplied context");
+  await assertReply(next, "Resumed with supplied context");
+  assert.equal((await (await restarted.request("/metrics")).json()).historyMatches.no_tracked_chat, 1);
 });
 
 test("rejects untrusted origins and protects chat and metrics with the configured key", { timeout: 10000 }, async (t) => {

@@ -116,11 +116,24 @@ Reload Continue's config and select this model in **Agent** mode. Attach the Pyt
 
 ### Chat reuse
 
-The IDE can keep sending its usual OpenAI-compatible history. When the gateway recognizes a follow-up, it sends only the new turn, including any new tool results and screenshots, to the same ChatGPT chat. It resends instructions and tool definitions when they change. Cline tool-call IDs help the gateway recognize the task even when Cline compacts the earlier history.
+The IDE can keep sending its usual OpenAI-compatible history. The gateway uses compact JSON for the transcript and tool definitions. When it recognizes a follow-up, it sends only the new turn, including tool results and screenshots, to the same ChatGPT chat. It resends instructions and tool definitions when they change. After Cline compacts history or splits a tool-call batch, the gateway can match that batch using the original call IDs, function names, and arguments.
 
-The gateway can reopen a matched chat in a browser tab. If ChatGPT rejects a follow-up as too long, the gateway retries the new turn as a text attachment in that chat. A new task or a history the gateway cannot match starts a fresh ChatGPT chat with the supplied context. The gateway keeps recent matches in memory until the server restarts.
+The gateway can reopen a matched chat in a browser tab. An ambiguous history, an unmatched history, or a server restart can require a fresh ChatGPT chat with the supplied context. Recent matches are held in memory.
 
-Restart the server, reload the unpacked extension, and refresh the ChatGPT tab after updating. API callers can explicitly request a fresh chat with `new_conversation: true`, or use `false` to continue in an open ChatGPT chat when there is no history match.
+Restart the server, reload the unpacked extension, and refresh the ChatGPT tab after updating. API callers can force a fresh chat with `new_conversation: true`. With `false` or no flag, the gateway requires a verified history match before reusing a chat.
+
+### Context and attachment settings
+
+Set these environment variables for the gateway server process. Restart the server to apply them.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CHATGPT_GATEWAY_MAX_PROMPT_BYTES` | `0` | Maximum UTF-8 bytes of prepared browser prompt text. `0` delegates the limit to ChatGPT. |
+| `CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS` | `0` | Maximum estimated tokens in the logical client input, including its supplied history, tool definitions, and an image allowance. `0` disables this local budget. |
+| `CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK` | `true` | Retry a ChatGPT draft-length rejection once as a text file. Set `false` for a `413` context-length error. |
+| `CHATGPT_GATEWAY_INCLUDE_HISTORICAL_IMAGES` | `true` | Include earlier screenshots when replaying history in a fresh chat and the current upload has room. Set `false` to keep their text and attach only current images. |
+
+Requests that exceed a configured budget return `413 context_length_exceeded` with guidance on what to reduce. The gateway keeps the supplied instructions, source, arguments, and tool-result text intact. When ChatGPT reports that its upload allowance is reached, the gateway returns `429 upload_allowance_exceeded`. A blocked draft that already has its screenshots attached keeps those files during the text-file retry. A custom browser byte limit or disabled text fallback requires the updated extension.
 
 ### Screenshot input
 
@@ -128,7 +141,7 @@ Restart the server, reload the unpacked extension, and refresh the ChatGPT tab a
 
 The gateway accepts Chat Completions `image_url` parts containing base64 data URLs, and MCP `image` parts with `mimeType` and base64 `data` in a tool result. It also recognizes a JSON-encoded MCP result in tool text. The extension uploads those images beside the prompt and the prompt references each attachment by filename.
 
-PNG, JPEG, WebP, and GIF are supported. Each browser turn can upload up to 8 images totaling 20 MiB, with a maximum of 8 MiB per image. When reusing a chat, the gateway uploads only the new screenshots. When replaying history in a fresh chat, it prioritizes the newest tool-result batch and keeps the text of earlier results whose images exceed the upload allowance. Send images inline as base64 data URLs.
+PNG, JPEG, WebP, and GIF are supported. Each browser turn can upload up to 8 images totaling 20 MiB, with a maximum of 8 MiB per image. When reusing a chat, the gateway uploads only the new screenshots. When replaying history, it prioritizes the newest tool-result batch, shares uploads for identical historical images, and keeps the text of results whose images are omitted. Send images inline as base64 data URLs.
 
 ### Local access
 
@@ -147,13 +160,16 @@ OpenAI-compatible chat completions endpoint.
 | `messages` | array | required | Array of `{role, content}` message objects |
 | `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
 | `stream` | boolean | `false` | Stream plain-text deltas as the browser renders them |
+| `stream_options.include_usage` | boolean | `false` | Include token estimates in the final stream chunk with empty `choices` |
 | `tools` | array | `[]` | Function definitions with draft-07 or 2020-12 JSON Schema parameters |
 | `tool_choice` | string or object | `"auto"` | `auto`, `none`, `required`, or a named function object |
 | `parallel_tool_calls` | boolean | `true` | Set to `false` to allow at most one function call per reply |
-| `new_conversation` | boolean | automatic | Force a fresh chat with `true` or use an open chat with `false` |
+| `new_conversation` | boolean | automatic | Force a fresh chat with `true` or require a verified match for reuse with `false` |
 | `timeout` | number | `300000` | Max wait time in ms, including time in the browser queue |
 
 Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
+
+Non-streaming completions include `usage`. Input estimates cover the logical client context before history reuse, using the `o200k_base` tokenizer and a fixed estimate of 1,024 tokens per image. Output estimates cover returned text or tool calls. ChatGPT browser-side context, vision costs, and reasoning tokens are unavailable to the gateway.
 
 ### `GET /health`
 
@@ -165,7 +181,14 @@ example: http://localhost:18790/health
 
 ### `GET /metrics`
 
-Returns request outcome counters, queue depth, browser busy status, and the most recent queue and browser times. Counters reset on restart.
+Returns request outcomes, queue and browser timings, and aggregate diagnostics. Counters reset on restart. Metrics contain no prompt, response, credentials, or chat identifiers.
+
+- `incomingRequestCharacters` and `incomingRequestBytes` count complete HTTP bodies read. Character counts use UTF-16 code units and byte counts use UTF-8.
+- `outgoingPromptCharacters` and `outgoingPromptBytes` measure text delivered to the browser extension for composing turns, including retry prompts. `imageAttachmentCount`, `textAttachmentFallbackCount`, and `textAttachmentBytes` measure attachment attempts. Older extensions report only the prepared initial prompt and its images.
+- `estimatedInputTokens` and `estimatedOutputTokens` follow the same accounting as completion usage. The input counter includes parsed requests rejected by configured budgets.
+- `fullHistoryRequests` and `continuationRequests` count dispatched routes. `historyMatches` explains routing decisions. `conversationReuseSuccessRate` measures successful same-chat completions among continuation attempts. `toolDefinitionReuseRate` measures omitted catalogs among tool-enabled requests.
+- `oversizedRequestCount` counts size-limit errors and recovered oversized drafts. `uploadAllowanceErrors` counts ChatGPT upload-allowance failures.
+- `redundantDataAvoidedPercent` compares the original full text baseline with prompt and text-attachment bytes delivered to the extension. The baseline uses pretty-printed client history and tool definitions with image data excluded, or plain text for a single text-only user message. The estimate includes gateway prompt overhead and is floored at zero.
 
 ## MCP Server
 
