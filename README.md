@@ -1,16 +1,6 @@
 # ChatGPT Gateway
 
-> **Optimized successor:** for smooth ChatGPT **Pro** (extended thinking) access without
-> a manual browser tab, see [`camoufox-gateway/`](camoufox-gateway/) — a headless Camoufox
-> (stealth Firefox) with a persistent logged-in profile, auto-login, robust
-> response-completion, exposed as a Claude Code skill + MCP. This extension still works
-> for quick use in your everyday browser.
-
-Use ChatGPT from any code, script, or tool — without an API key.
-
-This is a browser extension paired with a tiny local server that exposes your **logged-in ChatGPT session** as a standard OpenAI-compatible API at `localhost:18790`. Any application that speaks the OpenAI chat completions format can use it out of the box — just swap the base URL.
-
-**Why?** OpenAI API access requires a separate paid plan and API keys. If you already have a ChatGPT subscription (Free, Plus, or Team), this tool lets you use it programmatically. It automates the ChatGPT web interface through your browser — exactly like you would manually, but from code.
+ChatGPT Gateway is a loopback OpenAI-compatible endpoint for Cline, Continue, and other local clients. Its default transport uses the signed-in browser extension for interactive IDE turns. Authenticated client sessions share one queue and keep their conversation and tool state isolated. The browser configuration needs no upstream API key.
 
 ![ChatGPT Gateway Icon](icons/icon128.png)
 
@@ -225,27 +215,43 @@ When diagnosing a request, compare `preparedTextBytes` and `fullTextBytes` with 
 
 Set `CHATGPT_GATEWAY_MONITOR_ENABLED=false` and restart to disable monitoring. To remove retained diagnostics, stop the gateway and remove only its `gateway-monitor*.jsonl` files in the configured log directory. The defaults are `%LOCALAPPDATA%/chatgpt-gateway/monitor` on Windows and `~/.local/state/chatgpt-gateway/monitor` elsewhere. If the dashboard reports a disconnected extension, check `/health` and reload the extension. If only browser observations are missing, send a test message and check that `telemetryV1` is listed under Extension.
 
-## Software Factory transport
+## Shared Gateway sessions and transports
 
-Run a separate Gateway instance for factory development. It serves the same OpenAI-compatible `/v1` routes on the selected loopback port. The usual browser-backed instance remains available for interactive IDE use. Its transcript-based conversation matching is shared and is unsuitable for independent factory workers.
+The default backend is `browser`. Cline and Continue can use it interactively at `http://127.0.0.1:18790/v1`, with model `auto`. This configuration uses a local Gateway key for client isolation and requires no upstream API credential.
 
-Set `CHATGPT_GATEWAY_FACTORY_TRANSPORT=mock` for local tests. Use `factory-mock` as the model. To configure the supported programmatic adapter, explicitly select `openai`, set `CHATGPT_GATEWAY_OPENAI_API_KEY` to an authorized project key, and put allowed Chat Completions model IDs in `CHATGPT_GATEWAY_FACTORY_MODELS` as a comma-separated list. Provide an already-created, private, absolute directory outside the source tree in `CHATGPT_GATEWAY_FACTORY_STATE_DIR`. If `upstream-in-flight.json` survives an interrupted run, reconcile the provider outcome before retiring the checkpoint and restarting. It contains only the gateway request ID and start time. The Gateway sends no requests while an earlier outcome is uncertain. Never clear a checkpoint owned by a running instance.
+### Use two interactive clients
 
-In factory mode, set `CHATGPT_GATEWAY_API_KEY` to a random admin key. Startup profiles are optional. To configure them, supply `CHATGPT_GATEWAY_FACTORY_CLIENTS` through the protected environment as a JSON array of profiles with `token`, `clientId`, `sessionId`, `factoryRunId`, and `role`. Use distinct random worker keys of at least 24 URL-safe characters and one profile per worker session. Worker keys authorize models, completions and cancellation within their own session. A worker can use the OpenAI-compatible base URL plus its assigned key without adding identity headers. `/health` includes factory mode and local dispatch readiness. Use the authenticated metrics or monitor for queue state. Provider access and billing require separate verification.
+1. Set `CHATGPT_GATEWAY_API_KEY` in the Gateway process to a random URL-safe secret of at least 24 characters. Use this local admin key to issue sessions and access monitoring.
+2. Start the server, reload the unpacked extension, and refresh the ChatGPT tab. Open one signed-in ChatGPT tab. The extension advertises scoped conversation support after reconnecting and checks the content script again before sending.
+3. Issue a separate scoped key for each independent client. In PowerShell, use the admin key from the environment. The example stores the new credentials in variables.
 
-The factory operator can also issue temporary worker keys without restarting the Gateway. These endpoints require the Gateway admin bearer key.
+```powershell
+$headers = @{ Authorization = "Bearer $env:CHATGPT_GATEWAY_API_KEY" }
+$base = 'http://127.0.0.1:18790/v1'
+$first = Invoke-RestMethod "$base/sessions" -Method Post -Headers $headers -ContentType 'application/json' `
+    -Body '{"clientId":"cline","factoryRunId":"interactive-demo","role":"developer"}'
+$second = Invoke-RestMethod "$base/sessions" -Method Post -Headers $headers -ContentType 'application/json' `
+    -Body '{"clientId":"continue","factoryRunId":"interactive-demo","role":"reviewer"}'
+```
 
-| Method and path | Behavior |
-|---|---|
-| `POST /v1/factory/sessions` | Send `{"clientId":"worker-1","factoryRunId":"run-42","role":"developer"}`. HTTP 201 returns a fresh `sessionId`, `token`, `expiresAt` and opaque `runTag`. Give only the issued token to the worker. |
-| `GET /v1/factory/sessions` | Lists active temporary sessions and their expiry. Tokens appear only in the creation response. |
-| `DELETE /v1/factory/sessions/:id` | Revokes an issued token and cancels its outstanding HTTP request. An active model operation retains its slot until the provider settles. |
+4. Set Cline's local API key to the issued value in `$first.token` and Continue's to `$second.token`. Both use the same base URL and model. Each key follows its own conversation and tool history. Requests from both clients can queue. The one browser slot runs them in order.
+5. Revoke a key with `DELETE /v1/sessions/:id` using the admin key. A running request keeps its slot until the adapter settles even after its client response has been cancelled.
 
-Roles are `planner`, `architect`, `developer`, `reviewer`, and `test-analyst`. Temporary credentials expire after `CHATGPT_GATEWAY_FACTORY_SESSION_MS` and are cleared on restart. Startup and temporary profiles share the `CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS` capacity (32 by default, 1–32 allowed). Expiry stops new requests. An admitted request can finish, and its lease retains capacity until it drains. If creation returns an uncertain outcome, reconcile the active sessions before creating another credential.
+Temporary keys expire after `CHATGPT_GATEWAY_SESSION_MS` and are cleared by restart. `GET /v1/sessions` lists active temporary sessions without token values. Optional deployment-managed browser or programmatic profiles can be loaded using `CHATGPT_GATEWAY_CLIENTS` with `token`, `clientId`, `sessionId`, `factoryRunId`, and `role`. Roles are `planner`, `architect`, `developer`, `reviewer`, and `test-analyst`. Static and temporary profiles share a 32-session limit by default.
 
-The factory transport uses one model slot, native tool schemas, and full client context. A later tool result must match a call issued to that scoped session. A restart or expiry invalidates old tool-call correlations. Cancellations and client timeouts retire the HTTP request while the upstream operation drains. Status `429` includes retry guidance where available. An ambiguous upstream result pauses dispatch for reconciliation. No automatic model retries or provider fallback are used.
+Existing browser clients with a shared or omitted key use a single legacy identity. Set `CHATGPT_GATEWAY_REQUIRE_SCOPED_CLIENTS=true` after migrating clients to individual keys to enforce isolation for all interactive requests. Scoped browser replies wait for conversation ownership to be confirmed before content is returned. They work through the existing ChatGPT tab and return policy or quota rejections to the caller.
 
-The factory queue supports `CHATGPT_GATEWAY_FACTORY_MAX_QUEUED` (8), `MAX_PER_CLIENT` (2), `MAX_BODY_BYTES` (4 MiB), `QUEUE_MS` (120 seconds), `PROCESS_MS` (300 seconds), `DRAIN_MS` (360 seconds), and `SESSION_MS` (1 hour), each with the `CHATGPT_GATEWAY_FACTORY_` prefix. The total admission budget is 32 MiB of reserved input bytes. Set the client timeout to accommodate queue and processing delays. Streaming text uses SSE, and native function arguments are validated before complete tool-call chunks are emitted. Real provider token usage is passed through when available, while the monitor labels estimates and records logical size separately from provider request bytes.
+### Select a backend
+
+| `CHATGPT_GATEWAY_TRANSPORT` | Use | Credential |
+|---|---|---|
+| `browser` (default) | User-driven interactive Cline and Continue | Existing signed-in browser and optional local Gateway authentication |
+| `mock` | Deterministic tests with model `factory-mock` | Local admin and scoped worker keys |
+| `openai` | Optional authorized Chat Completions adapter | Provider project key in `CHATGPT_GATEWAY_OPENAI_API_KEY`, model allowlist in `CHATGPT_GATEWAY_MODELS`, private state directory in `CHATGPT_GATEWAY_STATE_DIR`, and local scoped keys |
+
+The server selects one backend per process. `GET /v1/capabilities` reports connectivity, verified bearer scope if supplied, client isolation, adapter features, observed backend availability, and programmatic readiness. The browser connection and mock fixture are reported as distinct states. The OpenAI adapter remains unverified until it observes a successful provider response and returns to unverified when that evidence ages out. Keep an `upstream-in-flight.json` marker after an uncertain provider operation until the operator can reconcile it.
+
+The common queue defaults to eight waiting requests and one active execution. Scoped clients may hold up to two requests across their sessions. See [the architecture revision](doc/Unified_Gateway_Architecture.md) for limits, adapter contract and verification. Existing `CHATGPT_GATEWAY_FACTORY_*` settings and `/v1/factory/sessions` remain compatible aliases.
 
 ## MCP Server
 

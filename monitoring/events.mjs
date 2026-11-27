@@ -22,9 +22,10 @@ export const errors = {
   upstream_rate_limit: "The provider reported a rate or usage limit.", upstream_rejected: "The provider rejected the request.",
   upstream_authorization: "The provider denied access to the configured project or model.",
   session_revoked: "The Gateway admin revoked the factory worker session.",
+  conversation_conflict: "The browser adapter could not confirm the assigned conversation.",
 };
 const code = (value) => Object.hasOwn(errors, value);
-const knownCaps = ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1"];
+const knownCaps = ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1", "scopedConversations"];
 export const monitorCapabilities = (values) => knownCaps.filter((capability) => values?.has(capability));
 export function safeName(value) {
   if (typeof value !== "string" || !/^[a-z][a-z0-9_-]{0,63}$/i.test(value) ||
@@ -46,7 +47,7 @@ const sizes = { incomingBytes: isNumber, incomingCharacters: isNumber, logicalBy
 export const schemas = {
   "gateway.started": {}, "gateway.extension_connected": {}, "gateway.extension_disconnected": {},
   "gateway.extension_capabilities": { capabilities: (value) => Array.isArray(value) && value.length <= knownCaps.length && value.every((cap) => knownCaps.includes(cap)) },
-  "request.received": { role: oneOf("planner", "architect", "developer", "reviewer", "test-analyst"), transport: oneOf("mock", "openai"),
+  "request.received": { role: oneOf("planner", "architect", "developer", "reviewer", "test-analyst"), transport: (value) => typeof value === "string" && /^[a-z][a-z0-9-]{0,31}$/.test(value),
     runTag: (value) => typeof value === "string" && /^[a-f0-9]{16}$/.test(value) }, "request.input": { ...sizes, model: (value) => safeModel(value) === value },
   "request.queued": {}, "request.dispatched": {}, "request.completed": { estimatedOutputTokens: isNumber },
   "request.failed": { code }, "request.cancelled": { code }, "request.timed_out": { code },

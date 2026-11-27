@@ -80,6 +80,19 @@ function parseJson(json) {
   }
 }
 
+export function validatedToolCall(name, args, validators, requestId, index, observe, native = false) {
+  observe?.("tool.requested", name);
+  const validate = validators.get(name);
+  const parsed = native && typeof args === "string" ? parseJson(args) : args;
+  if (!validate || (native && typeof args !== "string") || !isObject(parsed) || !validate(parsed)) {
+    observe?.("tool.validation_failed", name);
+    throw new Error(validate ? `ChatGPT returned invalid arguments for ${name}` : "ChatGPT requested a function outside the allowed list");
+  }
+  observe?.("tool.validated", name);
+  return { id: `call_${requestId.replaceAll("-", "")}_${index}`, type: "function",
+    function: { name, arguments: native ? args : JSON.stringify(parsed) } };
+}
+
 function decodeReply(content, selection, validators, requestId, observe) {
   const { required, parallel } = selection;
   const json = unwrapJson(content);
@@ -103,24 +116,7 @@ function decodeReply(content, selection, validators, requestId, observe) {
     throw new Error("ChatGPT returned multiple function calls for a single-call request");
   }
 
-  const toolCalls = calls.map((call, index) => {
-    observe?.("tool.requested", call?.name);
-    const validate = validators.get(call?.name);
-    if (!validate) {
-      observe?.("tool.validation_failed", call?.name);
-      throw new Error("ChatGPT requested a function outside the allowed list");
-    }
-    if (!isObject(call.arguments) || !validate(call.arguments)) {
-      observe?.("tool.validation_failed", call.name);
-      throw new Error(`ChatGPT returned invalid arguments for ${call.name}`);
-    }
-    observe?.("tool.validated", call.name);
-    return {
-      id: `call_${requestId.replace(/-/g, "")}_${index}`,
-      type: "function",
-      function: { name: call.name, arguments: JSON.stringify(call.arguments) },
-    };
-  });
+  const toolCalls = calls.map((call, index) => validatedToolCall(call?.name, call?.arguments, validators, requestId, index, observe));
   return { content: null, toolCalls };
 }
 

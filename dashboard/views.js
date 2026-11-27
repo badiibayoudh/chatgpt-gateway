@@ -90,10 +90,11 @@ export function requests(rows, open, title = "Request history") {
 export function overview(status, rows, open) {
   const { health, totals, terminal, latency, resources, retention, browser, metrics } = status;
   const active = status.activeRequestId ? requestLink(status.activeRequestId, open) : "Idle";
-  const factory = metrics.factory;
-  const transport = factory ? [
-    ["Factory transport", pretty(factory.transport), factory.ready ? "Ready for local dispatch" : "Dispatch paused"],
-    ["Model slots", `${factory.activeSlots} / ${factory.capabilities.concurrency}`, "Active / configured"],
+  const backend = metrics.gateway;
+  const programmatic = backend?.capabilities.programmatic;
+  const transport = programmatic ? [
+    ["Backend", pretty(backend.transport), pretty(backend.availability)],
+    ["Model slots", `${metrics.activeSlots} / ${backend.capabilities.concurrency}`, "Active / configured"],
   ] : [
     ["Extension", health.extensionConnected ? "Connected" : "Disconnected", status.capabilities.join(" · ") || "Capabilities unavailable"],
     ["Browser", pretty(browser.status), browser.observedAt ? `Observed ${time(browser.observedAt)}` : "No recent observation"],
@@ -108,20 +109,20 @@ export function overview(status, rows, open) {
     ["Mean / P95 latency", `${duration(latency.meanMs)} / ${duration(latency.p95Ms)}`, `${latency.sample} recent completed requests, up to ${latency.window}`],
     ["Node RSS / heap", `${bytes(resources.rssBytes)} / ${bytes(resources.heapBytes)}`, "Gateway process memory"],
     ["CPU", percent(resources.cpuOneCorePercent), "100% represents one logical core"],
-    ...(factory ? [["Input reserved", bytes(factory.retainedBytes), "Read, queued and draining requests"],
-      ["Overloaded", count(factory.overloaded), "Requests denied admission"]] : [
+    ...(programmatic ? [["Input reserved", bytes(metrics.retainedBytes), "Read, queued and draining requests"],
+      ["Overloaded", count(metrics.overloaded), "Requests denied admission"]] : [
       ["Conversation reuse", percent(metrics.continuationRequests ? metrics.conversationReuseSuccessRate : null), `${count(metrics.continuationRequests)} continuation attempts`],
       ["Image attachments", count(metrics.imageAttachmentCount), `${count(metrics.textAttachmentFallbackCount)} text fallback attempts`],
     ]),
     ["Request outcomes", `${totals.failed} failed`, `${totals.cancelled} cancelled · ${totals.timed_out} timed out`],
     ["Telemetry", count(retention.events), `${retention.dropped} dropped · ${retention.evictedEvents} evicted · ${retention.storage.errors} storage errors`],
-  ]), table(factory ? "Model slot" : "Browser slot", ["Active request", "Waiting", "Log storage"], [[active, count(status.queued), retention.storage.enabled ? "JSONL enabled" : "Memory only"]]),
+  ]), table(programmatic ? "Model slot" : "Browser slot", ["Active request", "Waiting", "Log storage"], [[active, count(status.queued), retention.storage.enabled ? "JSONL enabled" : "Memory only"]]),
   requests(rows, open, "Recent requests"), recent];
 }
 
 export function context(view, open) {
   const { metrics, items, attachments } = view;
-  if (metrics.factory) return [table("Programmatic requests", ["Request", "Role", "Run tag", "Logical context", "Provider request", "Tool definitions", "Usage"],
+  if (metrics.gateway?.capabilities.programmatic) return [table("Programmatic requests", ["Request", "Role", "Run tag", "Logical context", "Provider request", "Tool definitions", "Usage"],
     items.map((row) => [requestLink(row.requestId, open), pretty(row.role), row.runTag, bytes(row.logicalBytes), bytes(row.wireBytes),
       count(row.exposedTools), row.providerUsage ? `${count(row.providerUsage.input)} / ${count(row.providerUsage.output)} (${row.providerUsage.authoritative ? "transport" : "estimated"})` : "—"]))];
   const reduction = (row) => row.fullTextBytes && row.forwardedTextBytes != null
@@ -161,11 +162,11 @@ export function logs(rows, open, title = "Structured events") {
 
 export function detail(data, open) {
   const r = data.request;
-  const stage = r.transport ? [["Provider / delivery", `${duration(r.serviceMs)} / ${duration(r.deliveryMs)}`],
+  const stage = r.transport && r.transport !== "browser" ? [["Provider / delivery", `${duration(r.serviceMs)} / ${duration(r.deliveryMs)}`],
     ["Worker role", pretty(r.role), r.runTag]] : [["Browser / delivery", `${duration(r.browserMs)} / ${duration(r.deliveryMs)}`],
     ["Generation observed", duration(r.generationStartMs), "After Send, based on server receipt"]];
   const fragments = [cards([["Status", pretty(r.state)], ["Total / queue", `${duration(r.durationMs)} / ${duration(r.queueMs)}`],
-    ...stage,
+    ...stage, ...(r.transport === "browser" && r.role ? [["Worker role", pretty(r.role), r.runTag]] : []),
     ["Input / output tokens", `${count(r.providerUsage?.input ?? r.estimatedInputTokens)} / ${count(r.providerUsage?.output ?? r.estimatedOutputTokens)}`],
     ["Logical / forwarded", `${bytes(r.logicalBytes)} / ${bytes(r.wireBytes ?? r.forwardedTextBytes)}`],
     ["Route", pretty(r.mode), pretty(r.reuseReason)], ["Error", pretty(r.errorCode), r.errorMessage]]),

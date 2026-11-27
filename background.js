@@ -30,7 +30,7 @@ function connect() {
     log("Connected to gateway server");
     sendToServer(socket, {
       type: "hello",
-      capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1"],
+      capabilities: ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1", "scopedConversations"],
     });
     if (reconnectTimer) {
       clearInterval(reconnectTimer);
@@ -120,8 +120,8 @@ async function isConversationReady(tabId, url) {
   return page?.ok && chatUrl(page.url) === chatUrl(url);
 }
 
-async function reopenConversation(url) {
-  const tab = await chrome.tabs.create({ url, active: false });
+async function reopenConversation(url, existing) {
+  const tab = existing ? await chrome.tabs.update(existing.id, { url }) : await chrome.tabs.create({ url, active: false });
   for (let attempt = 0; attempt < 40; attempt++) {
     if (await isConversationReady(tab.id, url)) return tab;
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -163,11 +163,18 @@ async function handleChatMessage(msg, socket) {
     const ready = await Promise.all(matches.map(({ id }) => isConversationReady(id, expectedConversation)));
     candidates = matches.filter((_, index) => ready[index]);
     candidates.sort((left, right) => Number(right.id === continuation.tabId) - Number(left.id === continuation.tabId));
-    if (!candidates.length) candidates.push(await reopenConversation(expectedConversation));
+    if (!candidates.length && (!msg.scopedConversation || tabs.length)) {
+      candidates.push(await reopenConversation(expectedConversation, msg.scopedConversation ? tabs[0] : undefined));
+    }
   }
+  if (msg.scopedConversation) candidates = candidates.slice(0, 1);
   const errors = [];
   for (const tab of candidates) {
     try {
+      if (msg.scopedConversation) {
+        const page = await chrome.tabs.sendMessage(tab.id, { type: "ping" });
+        if (!page?.scopedConversations) throw new Error("Refresh the ChatGPT tab to enable isolated sessions.");
+      }
       if (msg.streamText || msg.telemetry === 1) browserRequests.set(msg.requestId, { socket, tabId: tab.id, msg });
       emitTelemetry(socket, msg, "browser.tab_located");
       const send = async (text, files, newConversation, expectedDraftUrl, fallback = false) => {
@@ -181,6 +188,7 @@ async function handleChatMessage(msg, socket) {
           newConversation,
           expectedConversation,
           expectedDraftUrl,
+          ...(msg.scopedConversation && { scopedConversation: true }),
           ...(msg.telemetry === 1 ? { telemetry: 1 } : {}),
         });
         if (!response.conversationChanged) {
@@ -197,7 +205,7 @@ async function handleChatMessage(msg, socket) {
       let response = await send(userMessage, attachments, newConversation);
       if (response.conversationChanged) throw new Error("ChatGPT navigated away from the task chat. Retry to reopen it.");
       const oversized = response.errorCode === "chatgpt_input_too_long" || response.errorCode === "chatgpt_draft_blocked";
-      if (msg.textAttachmentFallback !== false && oversized) {
+      if (!msg.scopedConversation && msg.textAttachmentFallback !== false && oversized) {
         const name = `gateway-request-${msg.requestId.slice(0, 8)}.txt`;
         const draftUrl = response.retryDraftUrl;
         const reason = response.error;

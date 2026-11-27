@@ -397,7 +397,7 @@
     throw new Error("Send button not found or disabled");
   }
 
-  async function waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe) {
+  async function waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe, routeChanged) {
     const deadline = Date.now() + MAX_WAIT;
     let lastTurnId = null;
     let lastText = "";
@@ -405,6 +405,7 @@
     let generationObserved = false;
 
     while (Date.now() < deadline) {
+      if (routeChanged?.()) throw new Error("ChatGPT conversation changed after submitting the prompt");
       if (observe && !generationObserved && isGenerating()) {
         generationObserved = true;
         observe("browser.generation_detected");
@@ -459,10 +460,21 @@
       const conversationChanged = () => expected && chatUrl(window.location.href) !== expected;
       const draftChanged = () => expectedDraft && chatUrl(window.location.href) !== expectedDraft;
       if (conversationChanged() || draftChanged()) return { ok: false, conversationChanged: true };
+      if (msg.scopedConversation && isGenerating()) {
+        return { ok: false, error: "The ChatGPT tab is still generating. Wait until it finishes before sending another turn." };
+      }
       // Start new conversation if requested
       if (msg.newConversation !== false) {
         await startNewChat();
         await selectModel(msg.model);
+      }
+      const fresh = () => window.location.pathname === "/" && !document.querySelector("main [data-message-author-role]");
+      const requireFresh = msg.scopedConversation && !expected;
+      if (msg.scopedConversation) {
+        const composer = (document.querySelector("#prompt-textarea") || findInput())?.closest("form");
+        if (!composer || (requireFresh && (msg.newConversation === false || !fresh())) || attachmentCounts(composer, "").composer) {
+          return { ok: false, error: "Could not confirm an empty composer for the isolated task. Open a fresh ChatGPT page and retry." };
+        }
       }
 
       if (msg.attachments?.length) {
@@ -471,7 +483,7 @@
         await attachFiles(msg.attachments, observe);
       }
       await typeMessage(msg.userMessage);
-      if (conversationChanged() || draftChanged()) return { ok: false, conversationChanged: true };
+      if (conversationChanged() || draftChanged() || (requireFresh && !fresh())) return { ok: false, conversationChanged: true };
       const previousTurns = new Set(
         Array.from(findAssistantMessages(), (message) => getTurnId(getAssistantTurn(message)))
       );
@@ -481,15 +493,26 @@
       await clickSend(msg.userMessage, msg.attachments?.length);
       observe?.("browser.prompt_submitted");
 
+      let assignedChat = expected;
+      const routeChanged = msg.scopedConversation ? () => {
+        const current = chatUrl(window.location.href);
+        if (assignedChat) return current !== assignedChat;
+        const path = window.location.pathname;
+        if (path === "/") return false;
+        if (!/^\/c\/[^/]+\/?$/.test(path)) return true;
+        assignedChat = current;
+        return false;
+      } : undefined;
+
       let streamed = "";
       const onProgress = msg.streamText ? (content) => {
         if (conversationChanged() || content === streamed || !content.startsWith(streamed)) return;
         streamed = content;
         chrome.runtime.sendMessage({ type: "chat-progress", requestId: msg.requestId, content }).catch(() => {});
       } : undefined;
-      const response = await waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe);
+      const response = await waitForNewResponse(previousTurns, previousNotices, previousUploadNotices, onProgress, observe, routeChanged);
 
-      if (conversationChanged()) throw new Error("ChatGPT conversation changed after submitting the prompt");
+      if (conversationChanged() || routeChanged?.()) throw new Error("ChatGPT conversation changed after submitting the prompt");
       return { ok: true, content: response, url: window.location.href };
     } catch (err) {
       if (err.code === "chatgpt_upload_allowance") observe?.("browser.prompt_rejected", { code: "upload_allowance" });
@@ -503,7 +526,7 @@
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "ping") {
-      sendResponse({ ok: true, url: window.location.href });
+      sendResponse({ ok: true, url: window.location.href, scopedConversations: true });
       return;
     }
 

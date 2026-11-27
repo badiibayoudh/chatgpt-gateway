@@ -133,9 +133,11 @@ async function poll() {
     if (current !== generation) return;
     if (data.sessionId !== status.sessionId) { refreshPending = true; return; }
     currentRows = data.items;
-    const factory = status.health.factory;
-    if (factory) connection(factory.ready ? `Factory online (${factory.transport})` : "Factory dispatch paused", factory.ready ? "good" : "warn");
-    else connection(status.health.extensionConnected ? "Gateway online" : "Extension disconnected", status.health.extensionConnected ? "good" : "warn");
+    const backend = status.health.gateway;
+    if (backend?.programmatic) {
+      const label = { simulated: "Mock transport", verified: "Provider verified", blocked: "Dispatch paused", unavailable: "Provider unavailable" }[backend.availability];
+      connection(label ?? "Provider unverified", backend.availability === "verified" ? "good" : "warn");
+    } else connection(status.health.extensionConnected ? "Interactive Gateway" : "Extension disconnected", status.health.extensionConnected ? "good" : "warn");
     lastRefresh = Date.now();
     $("refresh-status").textContent = `Updated ${new Date(lastRefresh).toLocaleTimeString()}`;
     if (failureCount) notice();

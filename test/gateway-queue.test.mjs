@@ -594,3 +594,91 @@ test("disabled monitor leaves the existing API operational", { timeout: 10000 },
   gateway.reply(0, "Normal response");
   await assertReply(pending, "Normal response");
 });
+
+test("interactive browser clients share one queue and keep identical histories in separate chats", { timeout: 10000 }, async (t) => {
+  const admin = "scoped-browser-admin-fixture-0000";
+  const gateway = await startGateway(t, admin, { CHATGPT_GATEWAY_REQUIRE_SCOPED_CLIENTS: "true" });
+  const auth = (token) => ({ Authorization: `Bearer ${token}` });
+  const capabilities = async (token) => (await gateway.request("/v1/capabilities", { headers: token && auth(token) })).json();
+  const register = async (clientId) => {
+    const response = await gateway.request("/v1/sessions", { method: "POST", headers: { ...auth(admin), "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId, factoryRunId: "browser-fixture", role: "developer" }) });
+    assert.equal(response.status, 201);
+    return (await response.json()).token;
+  };
+  const [alice, bob] = await Promise.all([register("alice"), register("bob")]);
+  const before = await capabilities(alice);
+  assert.equal(before.authentication.credential, "worker");
+  assert.equal(before.transport.capabilities.programmatic, false);
+  assert.equal(before.transport.programmaticReady, false);
+  assert.equal(before.clients.scopedAvailable, false);
+  gateway.send({ type: "hello", capabilities: ["scopedConversations", "conversationReuse", "continuationOnly"] });
+  await waitFor(async () => (await capabilities()).clients.scopedAvailable);
+  const user = { role: "user", content: "Identical prompt" };
+  const start = (token, messages = [user], extra = {}) => gateway.complete({ messages, ...extra }, { headers: auth(token) });
+  assert.equal((await start(admin)).status, 401);
+  const first = start(alice);
+  await waitFor(() => gateway.sent.length === 1);
+  const second = start(bob);
+  await gateway.waitForPending(2);
+  assert.equal(gateway.sent.length, 1);
+  assert.equal(gateway.sent[0].scopedConversation, true);
+  const foreignCancel = await gateway.request(`/v1/requests/${gateway.sent[0].requestId}`, { method: "DELETE", headers: auth(bob) });
+  assert.deepEqual(await foreignCancel.json(), { cancelled: false });
+  assert.equal((await start(alice)).status, 409);
+  gateway.reply(0, "Identical reply", { tabId: 7, url: "https://chatgpt.com/c/fixture-alice" });
+  await assertReply(first, "Identical reply");
+  await waitFor(() => gateway.sent.length === 2);
+  assert.equal(gateway.sent[1].newConversation, true);
+  assert.equal(gateway.sent[1].continuation, undefined);
+  gateway.reply(1, "Identical reply", { tabId: 7, url: "https://chatgpt.com/c/fixture-bob" });
+  await assertReply(second, "Identical reply");
+
+  const transcript = [user, { role: "assistant", content: "Identical reply" }, { role: "user", content: "Follow up" }];
+  const aliceNext = start(alice, transcript, { stream: true });
+  await waitFor(() => gateway.sent.length === 3);
+  assert.equal(gateway.sent[2].continuation.url, "https://chatgpt.com/c/fixture-alice");
+  assert.equal(gateway.sent[2].streamText, false);
+  // Even an extension response reporting another client's URL is refused before content delivery.
+  gateway.reply(2, "Text from the wrong chat", { tabId: 7, url: "https://chatgpt.com/c/fixture-bob" });
+  const conflict = await aliceNext;
+  assert.equal(conflict.status, 502);
+  assert.equal((await conflict.json()).error.code, "conversation_conflict");
+  const bobNext = start(bob, transcript);
+  await waitFor(() => gateway.sent.length === 4);
+  assert.equal(gateway.sent[3].continuation.url, "https://chatgpt.com/c/fixture-bob");
+  gateway.reply(3, "Bob only", { tabId: 7, url: "https://chatgpt.com/c/fixture-bob" });
+  await assertReply(bobNext, "Bob only");
+  const status = await (await gateway.request("/monitor/status", { headers: auth(admin) })).json();
+  assert.equal(status.health.gateway.programmatic, false);
+  assert.equal(status.metrics.maxObservedActive, 1);
+  const exported = await (await gateway.request("/monitor/export", { headers: auth(admin) })).text();
+  assert.doesNotMatch(exported, /Identical prompt|Text from the wrong chat|fixture-alice|fixture-bob/);
+});
+
+test("interactive tool results require a call issued to the authenticated session", { timeout: 10000 }, async (t) => {
+  const admin = "scoped-tool-admin-fixture-000000";
+  const token = (name) => `scoped-tool-worker-${name}-000000`;
+  const profiles = ["a", "b"].map((clientId) => ({ clientId, sessionId: "session", factoryRunId: "round-trip", role: "developer", token: token(clientId) }));
+  const gateway = await startGateway(t, admin, { CHATGPT_GATEWAY_CLIENTS: JSON.stringify(profiles) });
+  gateway.send({ type: "hello", capabilities: ["scopedConversations", "conversationReuse", "continuationOnly"] });
+  await waitFor(async () => (await (await gateway.request("/v1/capabilities")).json()).clients.scopedAvailable);
+  const call = (worker, messages) => gateway.complete({ messages, tools: [{ type: "function", function: { name: "inspect", parameters: { type: "object" } } }] },
+    { headers: { Authorization: `Bearer ${token(worker)}` } });
+  const user = { role: "user", content: "Inspect fixture" };
+  const first = call("a", [user]);
+  await waitFor(() => gateway.sent.length === 1);
+  gateway.reply(0, JSON.stringify({ gateway_request_id: gateway.sent[0].requestId, tool_calls: [{ name: "inspect", arguments: {} }] }),
+    { tabId: 8, url: "https://chatgpt.com/c/fixture-tool-a" });
+  const assistant = (await (await first).json()).choices[0].message;
+  const result = { role: "tool", tool_call_id: assistant.tool_calls[0].id, content: "Tool fixture" };
+  const foreign = await call("b", [user, assistant, result]);
+  assert.equal(foreign.status, 409);
+  assert.equal((await foreign.json()).error.code, "session_reset");
+  assert.equal(gateway.sent.length, 1);
+  const own = call("a", [user, assistant, result]);
+  await waitFor(() => gateway.sent.length === 2);
+  assert.equal(gateway.sent[1].continuation.url, "https://chatgpt.com/c/fixture-tool-a");
+  gateway.reply(1, "Inspected", { tabId: 8, url: "https://chatgpt.com/c/fixture-tool-a" });
+  await assertReply(own, "Inspected");
+});

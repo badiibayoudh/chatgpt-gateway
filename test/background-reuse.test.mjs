@@ -7,7 +7,7 @@ const script = await readFile(new URL("../background.js", import.meta.url), "utf
 const target = { id: 7, url: "https://chatgpt.com/c/fixture" };
 
 async function relay(tabs, { changed = false, tooLong = false, retryError, draftUrl, useContinuation = true,
-  fallback = true, quota = false } = {}) {
+  fallback = true, quota = false, scoped = false, currentContentScript = true } = {}) {
   let socket;
   const prompts = [];
   const reopened = [];
@@ -31,8 +31,12 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
           reopened.push({ url, active });
           return { id: 42, url };
         },
+        update: async (id, { url }) => {
+          reopened.push({ id, url });
+          return { id, url };
+        },
         sendMessage: async (id, message) => {
-          if (message.type === "ping") return { ok: true, url: target.url };
+          if (message.type === "ping") return { ok: true, url: target.url, scopedConversations: currentContentScript };
           prompts.push({ id, message });
           if (changed && message.expectedConversation) return { ok: false, conversationChanged: true };
           if (quota) return { ok: false, errorCode: "chatgpt_upload_allowance", error: "Upload allowance reached" };
@@ -50,6 +54,7 @@ async function relay(tabs, { changed = false, tooLong = false, retryError, draft
   await socket.onmessage({ data: JSON.stringify({
     type: "chat",
     requestId: "request",
+    scopedConversation: scoped,
     textAttachmentFallback: fallback,
     messages: [{ role: "user", content: "Full transcript" }],
     attachments: [{ name: "image-1.png", mimeType: "image/png", data: "fixture" }],
@@ -71,6 +76,22 @@ test("sends only the new turn to the matching tab even when another tab is liste
   assert.equal(prompts[0].message.userMessage, "New turn only");
   assert.equal(prompts[0].message.newConversation, false);
   assert.equal(replies[0].url, target.url);
+});
+
+test("scoped continuation navigates the existing tab and never retries a rejected prompt", async () => {
+  const tab = { ...target, url: "https://chatgpt.com/c/other" };
+  const { prompts, replies, reopened } = await relay([tab], { scoped: true, tooLong: true });
+  assert.deepEqual(reopened, [{ id: tab.id, url: target.url }]);
+  assert.equal(prompts.length, 1);
+  assert.equal(prompts[0].message.scopedConversation, true);
+  assert.equal(replies[0].errorCode, "chatgpt_input_too_long");
+});
+
+test("scoped turns reject stale content scripts before forwarding a prompt", async () => {
+  const { prompts, replies } = await relay([target], { scoped: true, currentContentScript: false });
+  assert.equal(prompts.length, 0);
+  assert.equal(replies[0].ok, false);
+  assert.match(replies[0].error, /Refresh/);
 });
 
 test("reopens the same chat when the tab has moved to a different conversation", async () => {

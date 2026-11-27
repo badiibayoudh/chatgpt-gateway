@@ -11,12 +11,14 @@ async function runAttachmentTurn(uploadSucceeds, {
   attachment = { name: "image-1.png", mimeType: "image/png", data: png }, tooLong = false, alertText,
   uploadLabel, localizedSend = false, ariaDisabled = false, existingPreview = false,
   userMessage = "Inspect the screenshot", inlineLimit = Infinity, draftTooltip, quotaAlert,
+  scoped = false, newChatStays = false,
 } = {}) {
   let receive;
   let now = 0;
   let pickerMounted = false;
   let uploaded = null;
   let submitted = false;
+  const location = new URL(scoped ? "https://chatgpt.com/c/previous" : "https://chatgpt.com/");
   const picker = {
     dispatchEvent(event) {
       if (event.type === "change" && uploadSucceeds) uploaded = this.files[0];
@@ -46,7 +48,7 @@ async function runAttachmentTurn(uploadSucceeds, {
   const send = {
     get disabled() { return input.textContent.length > inlineLimit; },
     getAttribute: (name) => name === "aria-disabled" && ariaDisabled ? "true" : null,
-    click() { submitted = true; },
+    click() { submitted = true; if (scoped) location.pathname = "/c/new"; },
   };
   const retry = {
     textContent: "Erneut versuchen",
@@ -64,13 +66,15 @@ async function runAttachmentTurn(uploadSucceeds, {
   runInNewContext(script, {
     atob, File, DataTransfer, Event,
     console: { log() {} },
-    window: { location: { href: "https://chatgpt.com/" } },
+    window: { location },
     setTimeout(callback, ms) { now += ms; queueMicrotask(callback); },
     Date: { now: () => now },
     chrome: { runtime: { onMessage: { addListener: (listener) => { receive = listener; } } } },
     document: {
       createElement: () => ({}),
       querySelector(selector) {
+        if (selector === 'a[href="/"]' && scoped) return { click() { if (!newChatStays) location.pathname = "/"; } };
+        if (selector === "main [data-message-author-role]" && location.pathname === "/c/previous") return {};
         if (selector === '#upload-files[type="file"]') return pickerMounted ? picker : null;
         if (selector === '[data-testid="composer-plus-btn"]') {
           return { click() { pickerMounted = true; } };
@@ -105,11 +109,30 @@ async function runAttachmentTurn(uploadSucceeds, {
   const response = await new Promise((resolve) => receive({
     type: "chat",
     userMessage,
+    scopedConversation: scoped,
     attachments: [attachment],
-    newConversation: false,
+    newConversation: scoped,
   }, {}, resolve));
   return { response, uploaded, submitted };
 }
+
+test("scoped browser requests refuse an old chat or a composer containing a previous attachment", async () => {
+  for (const options of [{ newChatStays: true }, { existingPreview: true }]) {
+    const { response, submitted, uploaded } = await runAttachmentTurn(true, { scoped: true, ...options });
+    assert.equal(response.ok, false);
+    assert.match(response.error, /empty composer/);
+    assert.equal(uploaded, null);
+    assert.equal(submitted, false);
+  }
+});
+
+test("a scoped browser request accepts an attachment in its own fresh, confirmed chat", async () => {
+  const { response, submitted, uploaded } = await runAttachmentTurn(true, { scoped: true });
+  assert.equal(response.ok, true);
+  assert.equal(response.url, "https://chatgpt.com/c/new");
+  assert.ok(uploaded);
+  assert.equal(submitted, true);
+});
 
 test("uploads the original image bytes through the ChatGPT file input", async () => {
   const { response, uploaded, submitted } = await runAttachmentTurn(true);

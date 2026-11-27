@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { factoryConfig } from "../communication/factory-config.mjs";
-import { createWorkerRegistry } from "../communication/factory-sessions.mjs";
-import { openAiTransport } from "../communication/factory-transport.mjs";
+import { gatewayConfig } from "../communication/config.mjs";
+import { createWorkerRegistry } from "../communication/sessions.mjs";
+import { openAiTransport } from "../communication/programmatic-transports.mjs";
 
 const adminKey = "factory-admin-fixture-00000000";
 const profiles = ["one", "two", "three"].map((key) => ({ token: `factory-worker-fixture-${key}-0000`,
@@ -82,8 +82,8 @@ test("scoped workers with identical prompts and tools receive distinct calls and
   assert.deepEqual(calls.map((row) => row.originRequestId).sort(), ids.sort());
   assert.ok(calls.every(({ resultRequestId }) => resultRequestId));
   const stats = await gateway.read("/metrics");
-  assert.equal(stats.factory.maxObservedActive, 1);
-  assert.equal(stats.factory.activeSlots, 0);
+  assert.equal(stats.maxObservedActive, 1);
+  assert.equal(stats.activeSlots, 0);
   const requests = await gateway.read("/monitor/requests");
   assert.equal(new Set(requests.items.map(({ conversationId }) => conversationId)).size, 2);
   assert.equal(new Set(requests.items.map(({ runTag }) => runTag)).size, 1);
@@ -110,11 +110,11 @@ test("one execution slot, scoped cancellation, admission and drain after active 
   assert.equal(await cancel(active, 0), true);
   assert.equal(await cancel(active, 0), false);
   assert.equal((await slow).status, 409);
-  assert.equal((await gateway.read("/metrics")).factory.activeSlots, 1);
+  assert.equal((await gateway.read("/metrics")).activeSlots, 1);
   const next = await gateway.complete(2, [user()]);
   assert.equal(next.status, 200);
   assert.equal((await next.json()).choices[0].message.content, `Mock reply ${next.headers.get("x-request-id")}`);
-  const { factory } = await gateway.read("/metrics");
+  const factory = await gateway.read("/metrics");
   assert.equal(factory.cancelled, 2);
   assert.equal(factory.maxObservedActive, 1);
   assert.equal(factory.retainedBytes, 0);
@@ -123,22 +123,22 @@ test("one execution slot, scoped cancellation, admission and drain after active 
 test("queue and processing deadlines release only settled jobs and bridge client disconnect", { timeout: 10000 }, async (t) => {
   const gateway = await start(t, { CHATGPT_GATEWAY_FACTORY_QUEUE_MS: "90", CHATGPT_GATEWAY_FACTORY_PROCESS_MS: "180" });
   const slow = gateway.complete(0, [user("fixture:slow")]);
-  await waitFor(async () => (await gateway.read("/metrics")).factory.activeSlots);
+  await waitFor(async () => (await gateway.read("/metrics")).activeSlots);
   const response = await gateway.complete(1, [user()]);
   assert.equal(response.status, 504);
   assert.equal((await response.json()).error.code, "queue_timeout");
   const processed = await slow;
   assert.equal((await processed.json()).error.code, "processing_timeout");
-  assert.equal((await gateway.read("/metrics")).factory.activeSlots, 1);
-  await waitFor(async () => !(await gateway.read("/metrics")).factory.activeSlots);
+  assert.equal((await gateway.read("/metrics")).activeSlots, 1);
+  await waitFor(async () => !(await gateway.read("/metrics")).activeSlots);
   const controller = new AbortController();
   const aborted = assert.rejects(gateway.complete(0, [user("fixture:slow")], {}, { signal: controller.signal }), /abort/i);
-  await waitFor(async () => (await gateway.read("/metrics")).factory.activeSlots);
+  await waitFor(async () => (await gateway.read("/metrics")).activeSlots);
   controller.abort();
   await aborted;
-  await waitFor(async () => (await gateway.read("/metrics")).factory.cancelled === 1);
-  assert.equal((await gateway.read("/metrics")).factory.activeSlots, 1);
-  await waitFor(async () => !(await gateway.read("/metrics")).factory.activeSlots);
+  await waitFor(async () => (await gateway.read("/metrics")).cancelled === 1);
+  assert.equal((await gateway.read("/metrics")).activeSlots, 1);
+  await waitFor(async () => !(await gateway.read("/metrics")).activeSlots);
   assert.equal((await gateway.complete(1, [user()])).status, 200);
 });
 
@@ -165,11 +165,11 @@ test("factory streaming, restart reset, authorization, and provider errors", { t
   const uncertain = await restarted.complete(0, [user("fixture:uncertain")]);
   assert.equal((await uncertain.json()).error.code, "upstream_uncertain");
   assert.equal((await restarted.complete(1, [user()])).status, 503);
-  assert.equal((await (await restarted.call("/health")).json()).factory.ready, false);
+  assert.equal((await (await restarted.call("/health")).json()).gateway.availability, "blocked");
 });
 
 test("programmatic adapter retains native schemas, usage and SSE without contacting a provider", async () => {
-  assert.throws(() => factoryConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: JSON.stringify([profiles[0], profiles[0]]) }), /Duplicate/);
+  assert.throws(() => gatewayConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: JSON.stringify([profiles[0], profiles[0]]) }), /Duplicate/);
   const progress = [];
   const transmitted = [];
   const mockedFetch = async (url, options) => {
@@ -178,11 +178,13 @@ test("programmatic adapter retains native schemas, usage and SSE without contact
     return new Response('data: {"choices":[{"delta":{"content":"hello"}}]}\r\n\r\ndata: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}\n\ndata: [DONE]\n\n');
   };
   const adapter = openAiTransport({ upstreamKey: "fixture", drainMs: 100 }, mockedFetch);
+  assert.equal(adapter.availability().state, "unverified");
   const result = await adapter.complete({ model: "fixture-model", stream: true, tools }, {
     progress: (text) => progress.push(text), transmitted: (...bytes) => transmitted.push(bytes),
   });
   assert.deepEqual(progress, ["hello"]);
   assert.equal(result.usage.total_tokens, 3);
+  assert.equal(adapter.availability().state, "verified");
   assert.ok(transmitted[0][0] > 0);
   const interrupted = openAiTransport({ upstreamKey: "fixture", drainMs: 100 }, async () => new Response('data: {"choices":[]}\n\n'));
   await assert.rejects(interrupted.complete({ stream: true }, { progress() {}, transmitted() {} }), { code: "upstream_uncertain" });
@@ -234,14 +236,14 @@ test("administrator provisions, lists and revokes bounded worker sessions withou
   assert.ok(listing.items.every((item) => !Object.hasOwn(item, "token")));
   assert.equal((await chat(adminKey)).status, 401);
   const slow = chat(first.token, "fixture:slow");
-  await waitFor(async () => (await gateway.read("/metrics")).factory.activeSlots);
+  await waitFor(async () => (await gateway.read("/metrics")).activeSlots);
   const revoke = (id, token) => gateway.call(`${sessions}/${id}`, token, { method: "DELETE" });
   assert.equal((await revoke(first.sessionId, second.token)).status, 401);
   assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, true);
   assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, false);
   assert.equal((await (await slow).json()).error.code, "session_revoked");
   assert.equal((await chat(first.token)).status, 401);
-  assert.equal((await gateway.read("/metrics")).factory.activeSlots, 1);
+  assert.equal((await gateway.read("/metrics")).activeSlots, 1);
   assert.equal((await issue()).status, 429);
   const other = await chat(second.token);
   assert.equal(other.status, 200);
@@ -251,7 +253,7 @@ test("administrator provisions, lists and revokes bounded worker sessions withou
 });
 
 test("an expired session rejects credentials while its in-flight slot keeps the lease", () => {
-  const config = factoryConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "1" });
+  const config = gatewayConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "1" });
   const busy = new Set();
   let clock = 0;
   const registry = createWorkerRegistry(config, busy, () => clock);

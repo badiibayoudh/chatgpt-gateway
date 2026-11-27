@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { digest, identifier, roles, tokenPattern, workerProfile } from "./factory-config.mjs";
-import { FactoryError } from "./factory-protocol.mjs";
+import { digest, identifier, roles, tokenPattern, workerProfile } from "./config.mjs";
+import { GatewayError } from "./protocol.mjs";
 
 const fields = ["clientId", "factoryRunId", "role"];
 
@@ -33,11 +33,11 @@ export function createWorkerRegistry(config, busy, now = Date.now) {
     register(body) {
       if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !fields.includes(key)) ||
         [body.clientId, body.factoryRunId].some((id) => typeof id !== "string" || !identifier.test(id)) || !roles.includes(body.role)) {
-        throw new FactoryError(400, "invalid_session", "Provide clientId, factoryRunId and a supported role for a new worker.");
+        throw new GatewayError(400, "invalid_session", "Provide clientId, factoryRunId and a supported role for a new worker.");
       }
       reap();
       if (leases.size + config.byToken.size >= config.maxSessions) {
-        throw new FactoryError(429, "session_capacity", "Worker session capacity is exhausted. Revoke an unused session or wait for it to expire.");
+        throw new GatewayError(429, "session_capacity", "Worker session capacity is exhausted. Revoke an unused session or wait for it to expire.");
       }
       const token = randomBytes(32).toString("base64url");
       const tokenKey = digest(token);

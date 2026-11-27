@@ -148,16 +148,17 @@ function sendExport(res, monitor, metadata, filter, rows) {
     return [JSON.stringify(header), ...events.map((item) => JSON.stringify(item))].join("\n") + "\n";
   } : () => JSON.stringify(report, null, 2);
   let body = serialize();
+  if (Buffer.byteLength(body) > monitor.config.exportBytes) {
+    // Prefer filtered events and request summaries over the unfiltered legend and aggregate counters.
+    delete report.errors;
+    delete report.status.metrics;
+    report.truncated = true;
+    body = serialize();
+  }
   while (Buffer.byteLength(body) > monitor.config.exportBytes && (items.length || report.requests.length)) {
     if (items.length) items.splice(0, Math.max(1, Math.ceil(items.length / 4)));
     else if (!filter.requestId || report.requests.length > 1) report.requests.shift();
     else break;
-    report.truncated = true;
-    body = serialize();
-  }
-  if (Buffer.byteLength(body) > monitor.config.exportBytes) {
-    delete report.errors;
-    delete report.status.metrics;
     report.truncated = true;
     body = serialize();
   }
