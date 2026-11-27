@@ -18,7 +18,7 @@ export function prepareNativePayload(body, models) {
   if (!models.includes(body.model)) throw invalid("Select a model enabled on the Gateway.");
   if (body.n !== undefined && body.n !== 1) throw invalid("The Gateway supports one completion choice.");
   if (body.new_conversation !== undefined || body.clientId !== undefined || body.sessionId !== undefined || body.factoryRunId !== undefined) {
-    throw invalid("Gateway ownership is configured with a scoped credential. Issue a new worker key for a new session.");
+    throw invalid("Select an independent conversation using its session base URL.");
   }
   try {
     const messages = body.messages ?? [];
@@ -81,7 +81,7 @@ export function validateOutput(result, prepared, requestId, observe) {
     ...(typeof message.refusal === "string" && { refusal: message.refusal }) };
 }
 
-export async function readBody(req, limit) {
+export async function readBody(req, limit, { allowEmpty = false } = {}) {
   if (Number(req.headers["content-length"]) > limit) {
     req.resume();
     throw new GatewayError(413, "context_length_exceeded", "Reduce the request body before retrying.", { legacyType: "context_length_exceeded" });
@@ -97,6 +97,7 @@ export async function readBody(req, limit) {
     parts.push(part);
   }
   const text = Buffer.concat(parts, bytes).toString("utf8");
+  if (allowEmpty && bytes === 0) return { body: {}, bytes, characters: 0 };
   try { return { body: JSON.parse(text), bytes, characters: text.length }; }
   catch { throw new GatewayError(400, "invalid_json", "Invalid JSON"); }
 }

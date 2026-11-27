@@ -16,11 +16,11 @@ async function waitFor(check) {
   assert.fail("Timed out waiting for the gateway state");
 }
 
-async function startGateway(t, apiKey = "", settings = {}) {
+async function startGateway(t, settings = {}) {
   const server = fileURLToPath(new URL("../server.mjs", import.meta.url));
   const child = spawn(process.execPath, [server], {
     env: {
-      ...process.env, PORT: "0", CHATGPT_GATEWAY_API_KEY: apiKey,
+      ...process.env, PORT: "0", CHATGPT_GATEWAY_TRANSPORT: "browser",
       CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "0", CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS: "0",
       CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "true", CHATGPT_GATEWAY_INCLUDE_HISTORICAL_IMAGES: "true",
       CHATGPT_GATEWAY_MONITOR_ENABLED: "true", CHATGPT_GATEWAY_MONITOR_PERSIST: "false",
@@ -50,17 +50,23 @@ async function startGateway(t, apiKey = "", settings = {}) {
   t.after(() => browser.terminate());
   const send = (data) => browser.send(JSON.stringify(data));
   function request(path, options) { return fetch(base + path, options); }
-  function complete(payload, options) {
-    return request("/v1/chat/completions", {
+  function complete(payload, options, apiBase = "/v1") {
+    return request(`${apiBase}/chat/completions`, {
       method: "POST",
       ...options,
       headers: { "Content-Type": "application/json", ...options?.headers },
       body: JSON.stringify(payload),
     });
   }
+  async function createSession(clientId) {
+    const response = await request("/v1/sessions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId, factoryRunId: "browser-fixture", role: "developer" }) });
+    assert.equal(response.status, 201);
+    return (await response.json()).apiBase;
+  }
 
   return {
-    base, sent, send, request, complete,
+    base, sent, send, request, complete, createSession,
     async stop() {
       const exited = once(child, "exit");
       child.kill();
@@ -375,7 +381,7 @@ test("enforces browser byte and client token budgets before dispatch", { timeout
     ["CHATGPT_GATEWAY_MAX_PROMPT_BYTES", /Browser prompt exceeds/],
     ["CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS", /token budget/],
   ]) {
-    const gateway = await startGateway(t, "", { [setting]: "10" });
+    const gateway = await startGateway(t, { [setting]: "10" });
     const response = await gateway.complete({ messages: [
       { role: "system", content: "This system instruction and the tool data must remain intact." },
       { role: "user", content: "Inspect an entire file." },
@@ -388,7 +394,7 @@ test("enforces browser byte and client token budgets before dispatch", { timeout
     assert.equal(gateway.sent.length, 0);
     assert.equal((await (await gateway.request("/metrics")).json()).oversizedRequestCount, 1);
   }
-  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "4" });
+  const gateway = await startGateway(t, { CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "4" });
   const response = await gateway.complete({ messages: [{ role: "user", content: [
     { type: "text", text: "ééé" },
   ] }] });
@@ -397,7 +403,7 @@ test("enforces browser byte and client token budgets before dispatch", { timeout
 });
 
 test("enforces disabled text fallback and reports platform upload allowance as 429", { timeout: 10000 }, async (t) => {
-  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "false" });
+  const gateway = await startGateway(t, { CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "false" });
   assert.equal((await gateway.chat("Older extension")).status, 503);
   gateway.send({ type: "hello", capabilities: ["attachmentPolicy", "conversationReuse"] });
   await waitFor(async () => (await (await gateway.request("/health")).json()).conversationReuse);
@@ -431,8 +437,8 @@ test("a gateway restart starts fresh when the browser chat identity is no longer
   assert.equal((await (await restarted.request("/metrics")).json()).historyMatches.no_tracked_chat, 1);
 });
 
-test("rejects untrusted origins and protects chat and metrics with the configured key", { timeout: 10000 }, async (t) => {
-  const gateway = await startGateway(t, "fixture-token");
+test("serves local callers without keys and rejects cross-origin requests", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
   assert.equal((await gateway.request("/health")).status, 200);
   const foreign = await gateway.request("/health", { headers: { Origin: "https://example.org" } });
   assert.equal(foreign.status, 403);
@@ -440,14 +446,14 @@ test("rejects untrusted origins and protects chat and metrics with the configure
   const hostile = new WebSocket(gateway.base.replace("http:", "ws:") + "/ws", { origin: "https://example.org" });
   const [upgradeError] = await once(hostile, "error");
   assert.match(upgradeError.message, /403/);
-  assert.equal((await gateway.complete({})).status, 401);
-  assert.equal((await gateway.request("/metrics")).status, 401);
-  const authorized = { headers: { Authorization: "Bearer fixture-token" } };
-  const chat = gateway.complete({ messages: [{ role: "user", content: "Hello" }] }, authorized);
+  assert.equal((await gateway.complete({ messages: [{ role: "user", content: "Cross-origin" }] }, { headers: { Origin: "http://localhost:1" } })).status, 403);
+  assert.equal((await gateway.request("/health", { headers: { Origin: "chrome-extension://fixture" } })).status, 200);
+  assert.equal((await gateway.request("/metrics")).status, 200);
+  const chat = gateway.complete({ messages: [{ role: "user", content: "Hello" }] });
   await waitFor(() => gateway.sent.length === 1);
   gateway.reply(0, "Hi");
   await assertReply(chat, "Hi");
-  const stats = await (await gateway.request("/metrics", authorized)).json();
+  const stats = await (await gateway.request("/metrics")).json();
   assert.equal(stats.accepted, 1);
   assert.equal(stats.completed, 1);
   assert.ok(stats.lastQueueWaitMs >= 0);
@@ -477,51 +483,51 @@ test("holds the browser slot through client cancellation and skips expired queue
   await assertReply(next, "Correct reply");
 });
 
-test("serves only known static monitor files and protects data, filters and exports", { timeout: 10000 }, async (t) => {
-  const gateway = await startGateway(t, "monitor-secret", { CHATGPT_GATEWAY_MONITOR_EXPORT_BYTES: "8192" });
-  const headers = { Authorization: "Bearer monitor-secret" };
+test("serves only known local monitor files and validates filters and exports", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t, { CHATGPT_GATEWAY_MONITOR_EXPORT_BYTES: "8192" });
   const dashboard = await gateway.request("/dashboard");
   assert.equal(dashboard.status, 200);
   assert.match(dashboard.headers.get("content-security-policy"), /frame-ancestors 'none'/);
   assert.equal(dashboard.headers.get("x-content-type-options"), "nosniff");
-  assert.match(await dashboard.text(), /Gateway Monitor/);
+  const html = await dashboard.text();
+  assert.match(html, /Gateway Monitor/);
+  assert.doesNotMatch(html, /Access key/i);
   for (const file of ["app.js", "views.js", "api.js", "styles.css"]) {
     assert.equal((await gateway.request(`/dashboard/assets/${file}`)).status, 200);
   }
   assert.equal((await gateway.request("/dashboard/assets/..%2f..%2fserver.mjs")).status, 404);
-  assert.equal((await gateway.request("/monitor/status")).status, 401);
-  assert.equal((await gateway.request("/monitor/status", { headers: { ...headers, Origin: "http://localhost:14" } })).status, 403);
+  assert.equal((await gateway.request("/monitor/status")).status, 200);
+  assert.equal((await gateway.request("/monitor/status", { headers: { Origin: "http://localhost:14" } })).status, 403);
   const foreignHost = await new Promise((resolve, reject) => {
-    httpGet(gateway.base + "/monitor/status", { headers: { ...headers, Host: "example.invalid" } }, (response) => {
+    httpGet(gateway.base + "/monitor/status", { headers: { Host: "example.invalid" } }, (response) => {
       response.resume();
       resolve(response.statusCode);
     }).on("error", reject);
   });
   assert.equal(foreignHost, 403);
-  assert.equal((await gateway.request("/monitor/status", { method: "POST", headers })).status, 405);
+  assert.equal((await gateway.request("/monitor/status", { method: "POST" })).status, 405);
   for (const bad of ["limit=201", "limit=1&limit=2", "cursor=-1", "component=unknown", "from=invalid"]) {
-    assert.equal((await gateway.request(`/monitor/logs?${bad}`, { headers })).status, 400);
+    assert.equal((await gateway.request(`/monitor/logs?${bad}`)).status, 400);
   }
-  const first = await (await gateway.request("/monitor/logs?limit=1", { headers })).json();
+  const first = await (await gateway.request("/monitor/logs?limit=1")).json();
   assert.ok(first.nextCursor);
-  const second = await (await gateway.request(`/monitor/logs?limit=1&cursor=${first.nextCursor}`, { headers })).json();
+  const second = await (await gateway.request(`/monitor/logs?limit=1&cursor=${first.nextCursor}`)).json();
   assert.ok(second.items[0].sequence < first.items[0].sequence);
-  const wrong = await gateway.complete({ messages: false }, { headers });
+  const wrong = await gateway.complete({ messages: false });
   assert.equal(wrong.status, 400);
-  const { items } = await (await gateway.request("/monitor/requests?state=failed", { headers })).json();
+  const { items } = await (await gateway.request("/monitor/requests?state=failed")).json();
   assert.equal(items[0].errorCode, "invalid_request");
-  const bundle = await gateway.request(`/monitor/export?requestId=${items[0].requestId}&format=jsonl`, { headers });
+  const bundle = await gateway.request(`/monitor/export?requestId=${items[0].requestId}&format=jsonl`);
   assert.equal(bundle.status, 200);
   assert.match(bundle.headers.get("content-disposition"), /gateway-monitor\.jsonl/);
   assert.equal(bundle.headers.get("cache-control"), "no-store");
   const raw = await bundle.text();
   assert.ok(Buffer.byteLength(raw) <= 8192);
-  assert.doesNotMatch(raw, /monitor-secret|Authorization/);
   const lines = raw.trim().split("\n").map(JSON.parse);
   assert.equal(lines[0].requests[0].requestId, items[0].requestId);
   assert.ok(lines.length > 1);
   assert.ok(lines.slice(1).every(({ requestId }) => requestId === items[0].requestId));
-  const filtered = await gateway.request("/monitor/export?event=request.failed&code=invalid_request", { headers });
+  const filtered = await gateway.request("/monitor/export?event=request.failed&code=invalid_request");
   assert.equal(filtered.status, 200);
   assert.match(filtered.headers.get("content-disposition"), /gateway-monitor\.json"/);
   const diagnostic = await filtered.json();
@@ -583,7 +589,7 @@ test("links sanitized browser and tool events across a live HTTP and WebSocket f
 });
 
 test("disabled monitor leaves the existing API operational", { timeout: 10000 }, async (t) => {
-  const gateway = await startGateway(t, "", { CHATGPT_GATEWAY_MONITOR_ENABLED: "false" });
+  const gateway = await startGateway(t, { CHATGPT_GATEWAY_MONITOR_ENABLED: "false" });
   assert.equal((await gateway.request("/dashboard")).status, 404);
   assert.equal((await gateway.request("/monitor/status")).status, 404);
   assert.equal((await gateway.request("/health")).status, 200);
@@ -596,19 +602,11 @@ test("disabled monitor leaves the existing API operational", { timeout: 10000 },
 });
 
 test("interactive browser clients share one queue and keep identical histories in separate chats", { timeout: 10000 }, async (t) => {
-  const admin = "scoped-browser-admin-fixture-0000";
-  const gateway = await startGateway(t, admin, { CHATGPT_GATEWAY_REQUIRE_SCOPED_CLIENTS: "true" });
-  const auth = (token) => ({ Authorization: `Bearer ${token}` });
-  const capabilities = async (token) => (await gateway.request("/v1/capabilities", { headers: token && auth(token) })).json();
-  const register = async (clientId) => {
-    const response = await gateway.request("/v1/sessions", { method: "POST", headers: { ...auth(admin), "Content-Type": "application/json" },
-      body: JSON.stringify({ clientId, factoryRunId: "browser-fixture", role: "developer" }) });
-    assert.equal(response.status, 201);
-    return (await response.json()).token;
-  };
-  const [alice, bob] = await Promise.all([register("alice"), register("bob")]);
+  const gateway = await startGateway(t);
+  const capabilities = async (apiBase = "/v1") => (await gateway.request(`${apiBase}/capabilities`)).json();
+  const [alice, bob] = await Promise.all([gateway.createSession("alice"), gateway.createSession("bob")]);
   const before = await capabilities(alice);
-  assert.equal(before.authentication.credential, "worker");
+  assert.equal(Object.hasOwn(before, "authentication"), false);
   assert.equal(before.transport.capabilities.programmatic, true);
   assert.equal(before.transport.capabilities.interactive, true);
   assert.equal(before.transport.capabilities.unattended, false);
@@ -620,17 +618,17 @@ test("interactive browser clients share one queue and keep identical histories i
   const after = await capabilities(alice);
   assert.equal(after.transport.requestReady, true);
   assert.equal(after.transport.unattendedReady, false);
-  assert.equal((await capabilities()).transport.requestReady, false);
+  assert.equal((await capabilities()).transport.requestReady, true);
   const user = { role: "user", content: "Identical prompt" };
-  const start = (token, messages = [user], extra = {}) => gateway.complete({ messages, ...extra }, { headers: auth(token) });
-  assert.equal((await start(admin)).status, 401);
+  const start = (apiBase, messages = [user], extra = {}) => gateway.complete({ messages, ...extra }, undefined, apiBase);
+  assert.equal((await start("/sessions/unknown/v1")).status, 404);
   const first = start(alice);
   await waitFor(() => gateway.sent.length === 1);
   const second = start(bob);
   await gateway.waitForPending(2);
   assert.equal(gateway.sent.length, 1);
   assert.equal(gateway.sent[0].scopedConversation, true);
-  const foreignCancel = await gateway.request(`/v1/requests/${gateway.sent[0].requestId}`, { method: "DELETE", headers: auth(bob) });
+  const foreignCancel = await gateway.request(`${bob}/requests/${gateway.sent[0].requestId}`, { method: "DELETE" });
   assert.deepEqual(await foreignCancel.json(), { cancelled: false });
   assert.equal((await start(alice)).status, 409);
   gateway.reply(0, "Identical reply", { tabId: 7, url: "https://chatgpt.com/c/fixture-alice" });
@@ -656,35 +654,33 @@ test("interactive browser clients share one queue and keep identical histories i
   assert.equal(gateway.sent[3].continuation.url, "https://chatgpt.com/c/fixture-bob");
   gateway.reply(3, "Bob only", { tabId: 7, url: "https://chatgpt.com/c/fixture-bob" });
   await assertReply(bobNext, "Bob only");
-  const status = await (await gateway.request("/monitor/status", { headers: auth(admin) })).json();
+  const status = await (await gateway.request("/monitor/status")).json();
   assert.equal(status.health.gateway.programmatic, true);
   assert.equal(status.health.gateway.unattended, false);
   assert.equal(status.metrics.maxObservedActive, 1);
-  const exported = await (await gateway.request("/monitor/export", { headers: auth(admin) })).text();
+  const exported = await (await gateway.request("/monitor/export")).text();
   assert.doesNotMatch(exported, /Identical prompt|Text from the wrong chat|fixture-alice|fixture-bob/);
 });
 
-test("interactive tool results require a call issued to the authenticated session", { timeout: 10000 }, async (t) => {
-  const admin = "scoped-tool-admin-fixture-000000";
-  const token = (name) => `scoped-tool-worker-${name}-000000`;
-  const profiles = ["a", "b"].map((clientId) => ({ clientId, sessionId: "session", factoryRunId: "round-trip", role: "developer", token: token(clientId) }));
-  const gateway = await startGateway(t, admin, { CHATGPT_GATEWAY_CLIENTS: JSON.stringify(profiles) });
+test("interactive tool results require a call from the same session URL", { timeout: 10000 }, async (t) => {
+  const gateway = await startGateway(t);
+  const [alice, bob] = await Promise.all([gateway.createSession("alice"), gateway.createSession("bob")]);
   gateway.send({ type: "hello", capabilities: ["scopedConversations", "conversationReuse", "continuationOnly"] });
   await waitFor(async () => (await (await gateway.request("/v1/capabilities")).json()).clients.scopedAvailable);
-  const call = (worker, messages) => gateway.complete({ messages, tools: [{ type: "function", function: { name: "inspect", parameters: { type: "object" } } }] },
-    { headers: { Authorization: `Bearer ${token(worker)}` } });
+  const call = (apiBase, messages) => gateway.complete({ messages, tools: [{ type: "function", function: { name: "inspect", parameters: { type: "object" } } }] },
+    undefined, apiBase);
   const user = { role: "user", content: "Inspect fixture" };
-  const first = call("a", [user]);
+  const first = call(alice, [user]);
   await waitFor(() => gateway.sent.length === 1);
   gateway.reply(0, JSON.stringify({ gateway_request_id: gateway.sent[0].requestId, tool_calls: [{ name: "inspect", arguments: {} }] }),
     { tabId: 8, url: "https://chatgpt.com/c/fixture-tool-a" });
   const assistant = (await (await first).json()).choices[0].message;
   const result = { role: "tool", tool_call_id: assistant.tool_calls[0].id, content: "Tool fixture" };
-  const foreign = await call("b", [user, assistant, result]);
+  const foreign = await call(bob, [user, assistant, result]);
   assert.equal(foreign.status, 409);
   assert.equal((await foreign.json()).error.code, "session_reset");
   assert.equal(gateway.sent.length, 1);
-  const own = call("a", [user, assistant, result]);
+  const own = call(alice, [user, assistant, result]);
   await waitFor(() => gateway.sent.length === 2);
   assert.equal(gateway.sent[1].continuation.url, "https://chatgpt.com/c/fixture-tool-a");
   gateway.reply(1, "Inspected", { tabId: 8, url: "https://chatgpt.com/c/fixture-tool-a" });

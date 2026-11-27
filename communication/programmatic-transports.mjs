@@ -9,9 +9,9 @@ const responseLimit = 2 * 1024 * 1024;
 const uncertain = () => new GatewayError(503, "upstream_uncertain", "The provider did not confirm completion. Reconcile the upstream request before restarting Gateway inference.", { uncertain: true });
 const malformed = () => new GatewayError(502, "invalid_response", "The provider response exceeded its limit or used an invalid completion format.");
 
-export function openAiConfig(env, { admin, drainMs }) {
+export function openAiConfig(env, { drainMs }) {
   const upstreamKey = env.CHATGPT_GATEWAY_OPENAI_API_KEY;
-  if (!upstreamKey || upstreamKey === admin) throw new Error("Configure a separate authorized OpenAI project key for the Gateway");
+  if (!upstreamKey) throw new Error("Configure an authorized OpenAI project key for the selected provider");
   const stateDir = env.CHATGPT_GATEWAY_STATE_DIR ?? env.CHATGPT_GATEWAY_FACTORY_STATE_DIR;
   if (!stateDir || !isAbsolute(stateDir)) throw new Error("Configure an absolute private OpenAI transport state directory");
   const models = (env.CHATGPT_GATEWAY_MODELS ?? env.CHATGPT_GATEWAY_FACTORY_MODELS ?? "").split(",").map((model) => model.trim());

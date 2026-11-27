@@ -1,6 +1,6 @@
 # ChatGPT Gateway
 
-ChatGPT Gateway is a loopback OpenAI-compatible endpoint for Cline, Continue, and other local clients. Its default transport uses the signed-in browser extension for interactive IDE turns. Authenticated client sessions share one queue and keep their conversation and tool state isolated. The browser configuration needs no upstream API key.
+ChatGPT Gateway is a loopback OpenAI-compatible endpoint for Cline, Continue, and other local clients. Its default transport uses the signed-in browser extension for interactive IDE turns. Independent local sessions share one queue and keep their conversation and tool state isolated. The browser configuration needs no upstream API key.
 
 ![ChatGPT Gateway Icon](icons/icon128.png)
 
@@ -135,7 +135,7 @@ PNG, JPEG, WebP, and GIF are supported. Each browser turn can upload up to 8 ima
 
 ### Local access
 
-The server listens on `127.0.0.1` and `::1`. Set `CHATGPT_GATEWAY_API_KEY` on the server to require an `Authorization: Bearer ...` header for the API, including metrics. Use that key in Continue or Cline. Set the same environment variable for the bundled MCP wrapper when using it.
+The Gateway listens on 127.0.0.1 and ::1. Local applications can use the API, sessions, metrics and Monitor. Browser HTTP requests use the same origin, with an extension health-check exception.
 
 The browser extension connects over a separate loopback WebSocket. Set `CHATGPT_GATEWAY_EXTENSION_ORIGIN` to its exact extension origin if you want to restrict which extension can connect.
 
@@ -186,7 +186,7 @@ Start the gateway with `npm start` and open [Gateway Monitor](http://localhost:1
 
 Reload the unpacked extension and refresh ChatGPT after upgrading. Existing extensions still work and provide the gateway-side events. The new extension adds separately observed browser submission, generation, and attachment stages. A browser readiness observation becomes unknown after 60 seconds without another observation. Tool results indicate that the IDE returned a result. The gateway does not observe tool execution or account-wide upload allowance.
 
-With `CHATGPT_GATEWAY_API_KEY` configured, data requests require the same bearer key. Use **Access key** in the dashboard to enter it for the current tab. Without a key, other processes on the machine can read local monitoring data. Dashboard requests are read-only and restricted to the dashboard’s own loopback origin.
+Open the dashboard directly from the local Gateway. Local processes can read its sanitized request diagnostics.
 
 | Server setting | Default | Allowed values |
 |---|---:|---|
@@ -215,53 +215,46 @@ When diagnosing a request, compare `preparedTextBytes` and `fullTextBytes` with 
 
 Set `CHATGPT_GATEWAY_MONITOR_ENABLED=false` and restart to disable monitoring. To remove retained diagnostics, stop the gateway and remove only its `gateway-monitor*.jsonl` files in the configured log directory. The defaults are `%LOCALAPPDATA%/chatgpt-gateway/monitor` on Windows and `~/.local/state/chatgpt-gateway/monitor` elsewhere. If the dashboard reports a disconnected extension, check `/health` and reload the extension. If only browser observations are missing, send a test message and check that `telemetryV1` is listed under Extension.
 
-## Shared Gateway sessions and transports
+## Local Gateway sessions and transports
 
-The default backend is `browser`. Cline and Continue can use it interactively at `http://127.0.0.1:18790/v1`, with model `auto`. This configuration uses a local Gateway key for client isolation and requires no upstream API credential.
+For a single client, use `http://127.0.0.1:18790/v1` as its API base. The default backend uses model `auto` and the existing signed-in browser. If your client requires a value in its API key field, enter `unused`.
 
-### Use two interactive clients
+### Use two independent clients
 
-1. Set `CHATGPT_GATEWAY_API_KEY` in the Gateway process to a random URL-safe secret of at least 24 characters. Use this local admin key to issue sessions and access monitoring.
-2. Start the server, reload the unpacked extension, and refresh the ChatGPT tab. Open one signed-in ChatGPT tab. The extension advertises scoped conversation support after reconnecting and checks the content script again before sending.
-3. Issue a separate scoped key for each independent client. In PowerShell, use the admin key from the environment. The example stores the new credentials in variables.
+Create a session for each client and use its returned API base path. The Gateway accepts an empty POST for basic use. Optional `clientId`, `factoryRunId`, and `role` labels can help identify runs.
 
 ```powershell
-$headers = @{ Authorization = "Bearer $env:CHATGPT_GATEWAY_API_KEY" }
-$base = 'http://127.0.0.1:18790/v1'
-$first = Invoke-RestMethod "$base/sessions" -Method Post -Headers $headers -ContentType 'application/json' `
-    -Body '{"clientId":"cline","factoryRunId":"interactive-demo","role":"developer"}'
-$second = Invoke-RestMethod "$base/sessions" -Method Post -Headers $headers -ContentType 'application/json' `
-    -Body '{"clientId":"continue","factoryRunId":"interactive-demo","role":"reviewer"}'
+$gateway = 'http://127.0.0.1:18790'
+$cline = Invoke-RestMethod "$gateway/v1/sessions" -Method Post
+$continue = Invoke-RestMethod "$gateway/v1/sessions" -Method Post
+$clineBase = "$gateway$($cline.apiBase)"
+$continueBase = "$gateway$($continue.apiBase)"
 ```
 
-4. Set Cline's local API key to the issued value in `$first.token` and Continue's to `$second.token`. Both use the same base URL and model. Each key follows its own conversation and tool history. Requests from both clients can queue. The one browser slot runs them in order.
-5. Revoke a key with `DELETE /v1/sessions/:id` using the admin key. A running request keeps its slot until the adapter settles even after its client response has been cancelled.
+Use `$clineBase` in Cline and `$continueBase` in Continue. Reload the unpacked extension and refresh the ChatGPT tab if the server reports that scoped browser support is unavailable. Requests share one ordered browser slot and each session has its own conversation and tool history.
 
-A script you start while the signed-in ChatGPT tab is available can submit through the same session. In PowerShell, use a scoped key issued above.
+For scripts, call the same endpoint on your chosen base URL.
 
 ```powershell
-$workerHeaders = @{ Authorization = "Bearer $($first.token)" }
 $request = @{ model = 'auto'; messages = @(@{ role = 'user'; content = 'What is 1 + 3?' }) }
-$reply = Invoke-RestMethod "$base/chat/completions" -Method Post -Headers $workerHeaders `
+$reply = Invoke-RestMethod "$clineBase/chat/completions" -Method Post `
     -ContentType 'application/json' -Body ($request | ConvertTo-Json -Depth 5)
 $reply.choices[0].message.content
 ```
 
-Temporary keys expire after `CHATGPT_GATEWAY_SESSION_MS` and are cleared by restart. `GET /v1/sessions` lists active temporary sessions without token values. Optional deployment-managed browser or programmatic profiles can be loaded using `CHATGPT_GATEWAY_CLIENTS` with `token`, `clientId`, `sessionId`, `factoryRunId`, and `role`. Roles are `planner`, `architect`, `developer`, `reviewer`, and `test-analyst`. Static and temporary profiles share a 32-session limit by default.
-
-Existing browser clients with a shared or omitted key use a single legacy identity. Set `CHATGPT_GATEWAY_REQUIRE_SCOPED_CLIENTS=true` after migrating clients to individual keys to enforce isolation for all interactive requests. Scoped browser replies wait for conversation ownership to be confirmed before content is returned. They work through the existing ChatGPT tab and return policy or quota rejections to the caller.
+`GET /v1/sessions` lists active sessions. Close a session with `DELETE /v1/sessions/:id`. An active model operation keeps its slot until the adapter settles. Sessions expire after `CHATGPT_GATEWAY_SESSION_MS` (one hour by default) and are cleared when the Gateway restarts. Create another session if a scoped URL returns `session_not_found`. Session URLs keep conversation state separate. Any local process can use them.
 
 ### Select a backend
 
-| `CHATGPT_GATEWAY_TRANSPORT` | Use | Credential |
+| `CHATGPT_GATEWAY_TRANSPORT` | Use | Configuration |
 |---|---|---|
-| `browser` (default) | User-driven interactive Cline and Continue | Existing signed-in browser and optional local Gateway authentication |
-| `mock` | Deterministic tests with model `factory-mock` | Local admin and scoped worker keys |
-| `openai` | Optional authorized Chat Completions adapter | Provider project key in `CHATGPT_GATEWAY_OPENAI_API_KEY`, model allowlist in `CHATGPT_GATEWAY_MODELS`, private state directory in `CHATGPT_GATEWAY_STATE_DIR`, and local scoped keys |
+| `browser` (default) | User-driven interactive Cline, Continue and scripts | Signed-in browser and extension |
+| `mock` | Deterministic tests with model `factory-mock` | Local settings only |
+| `openai` | Optional authorized Chat Completions adapter | Provider project key in `CHATGPT_GATEWAY_OPENAI_API_KEY`, model allowlist in `CHATGPT_GATEWAY_MODELS`, and private state directory in `CHATGPT_GATEWAY_STATE_DIR` |
 
-The server selects one backend per process. Send your bearer key to `GET /v1/capabilities` to check `transport.requestReady` for that credential. `transport.capabilities.programmatic` identifies adapters callable through HTTP. The browser advertises `interactive: true` and `unattended: false`. `transport.unattendedReady` is reserved for verified, authorized unattended execution. The OpenAI adapter remains unverified until it observes a successful provider response and returns to unverified when that evidence ages out. Keep an `upstream-in-flight.json` marker after an uncertain provider operation until the operator can reconcile it.
+The server selects one backend per process. Query `/capabilities` on the API base you intend to use. `transport.requestReady` reports whether that base URL can submit to the current adapter. The browser advertises `interactive: true` and `unattended: false`. `transport.unattendedReady` reports verified, authorized unattended execution. An OpenAI response supplies provider availability evidence. Keep any `upstream-in-flight.json` marker after an uncertain provider operation until the operator can reconcile it.
 
-The common queue defaults to eight waiting requests and one active execution. Scoped clients may hold up to two requests across their sessions. See [the architecture revision](doc/Unified_Gateway_Architecture.md) for limits, adapter contract and verification. Existing `CHATGPT_GATEWAY_FACTORY_*` settings and `/v1/factory/sessions` remain compatible aliases.
+The common queue defaults to eight waiting requests and one active execution. Scoped clients may hold up to two requests across their sessions. See [the architecture](doc/Unified_Gateway_Architecture.md) for limits and verification.
 
 ## MCP Server
 

@@ -31,10 +31,6 @@ function extensionOrigin(origin = "") {
   return /^(?:chrome|moz)-extension:\/\/[a-z0-9-]+$/i.test(origin);
 }
 
-function localOrigin(origin) {
-  return extensionOrigin(origin) || /^https?:\/\//i.test(origin) && loopbackHost(origin.split("://")[1]);
-}
-
 function healthSnapshot(snapshot = gateway.snapshot()) {
   const legacy = transport.legacyHealth?.() ?? { extensionConnected: false, imageAttachments: false, conversationReuse: false, longMessageFallback: false };
   const availability = snapshot.paused ? "blocked" : transport.availability().state;
@@ -61,34 +57,32 @@ const serveMonitor = monitorRoutes(monitor, () => {
   return {
     health: healthSnapshot(state), metrics: metricsSnapshot(state), activeRequestId: state.activeRequestId, queued: state.queued,
     capabilities: transport.observedCapabilities?.() ?? [],
-    configuration: { ...settings, apiKeyRequired: !!config.admin, extensionOriginRestricted: !!EXTENSION_ORIGIN, connectionMode: "loopback",
+    configuration: { ...settings, extensionOriginRestricted: !!EXTENSION_ORIGIN, connectionMode: "loopback",
       maxBodyBytes: config.maxBody, transport: transport.id, maxQueued: config.maxQueued, maxSessions: config.maxSessions,
       ...(monitor.config && { requestRetention: monitor.config.requests, eventRetention: monitor.config.events,
         eventBytes: monitor.config.eventBytes, persist: monitor.config.persist, logFiles: monitor.config.logFiles, logBytes: monitor.config.logBytes }) },
   };
-}, gateway.monitorAllowed);
+});
 
 async function handleHttp(req, res) {
   const origin = req.headers.origin;
-  if (!loopbackHost(req.headers.host) || (origin && !localOrigin(origin))) {
+  const path = req.url.split("?")[0];
+  const ownOrigin = `http://${req.headers.host?.toLowerCase()}`;
+  const extensionHealth = path === "/health" && req.method === "GET" && extensionOrigin(origin);
+  if (!loopbackHost(req.headers.host) || (origin && origin.toLowerCase() !== ownOrigin && !extensionHealth)) {
     writeJson(res, 403, { error: "The gateway accepts only local requests" });
     return;
   }
-  const path = req.url.split("?")[0];
   if (isMonitorPath(path) && await serveMonitor(req, res, path)) return;
   if (origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
   if (req.method === "GET" && path === "/health") { writeJson(res, 200, healthSnapshot()); return; }
   if (await gateway.route(req, res, path)) return;
-  if (!gateway.monitorAllowed(req.headers.authorization)) {
-    writeJson(res, 401, { error: "Use the configured gateway API key as a Bearer token" });
-    return;
-  }
   if (req.method === "GET" && path === "/metrics") { writeJson(res, 200, metricsSnapshot()); return; }
   writeJson(res, 404, { error: "Not found" });
 }

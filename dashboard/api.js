@@ -1,15 +1,11 @@
-let accessKey = "";
-
-export function setAccessKey(value) { accessKey = value; }
-
 async function request(path, params, signal) {
   const search = new URLSearchParams(Object.entries(params ?? {}).filter(([, value]) => value !== null && value !== undefined && value !== ""));
   const response = await fetch(`/monitor/${path}${search.size ? `?${search}` : ""}`, {
-    signal, cache: "no-store", headers: accessKey ? { Authorization: `Bearer ${accessKey}` } : {},
+    signal, cache: "no-store",
   });
   if (!response.ok) {
     const body = await response.json().catch(() => null);
-    throw Object.assign(new Error(body?.error?.message ?? "The gateway is unavailable."), { status: response.status });
+    throw new Error(body?.error?.message ?? (typeof body?.error === "string" ? body.error : "The gateway is unavailable."));
   }
   return response;
 }

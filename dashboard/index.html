@@ -24,7 +24,7 @@
     <main id="main">
       <header class="topbar">
         <span id="connection" class="pill neutral" role="status">Connecting</span>
-        <div class="top-actions"><span id="refresh-status" class="fine" role="status"></span><button id="refresh" type="button">Refresh</button><button id="access" type="button">Access key</button></div>
+        <div class="top-actions"><span id="refresh-status" class="fine" role="status"></span><button id="refresh" type="button">Refresh</button></div>
       </header>
       <div class="body">
         <div class="heading"><h1 id="title">Overview</h1><div id="view-actions" class="actions"></div></div>
@@ -35,14 +35,6 @@
       </div>
     </main>
   </div>
-  <dialog id="auth" aria-labelledby="auth-title">
-    <form id="auth-form">
-      <h2 id="auth-title">Gateway access key</h2>
-      <p class="fine">The key stays in this dashboard tab’s memory.</p>
-      <label for="key">API key</label><input id="key" type="password" autocomplete="off" spellcheck="false">
-      <div class="actions"><button type="button" data-close="auth">Close</button><button class="primary" type="submit">Connect</button></div>
-    </form>
-  </dialog>
   <dialog id="inspector" class="inspector" aria-labelledby="inspector-title">
     <div class="detail-head"><div><h2 id="inspector-title">Request inspector</h2><span id="detail-id" class="mono fine"></span></div><button data-close="inspector" type="button">Close</button></div>
     <div class="actions detail-actions"><button id="copy-detail" type="button" disabled>Copy summary</button><button id="download-detail" type="button" disabled>Download JSON</button><span id="detail-notice" class="fine" role="status"></span></div>

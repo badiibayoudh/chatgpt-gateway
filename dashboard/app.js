@@ -1,4 +1,4 @@
-import { download, get, setAccessKey } from "./api.js";
+import { download, get } from "./api.js";
 import { button, context as contextView, detail, element, logs, overview, requests, time, tools } from "./views.js";
 
 const $ = (id) => document.getElementById(id);
@@ -11,7 +11,6 @@ let preferences = {};
 let active;
 let timer;
 let failureCount = 0;
-let authNeeded = false;
 let lastRefresh;
 let session;
 let currentRows;
@@ -30,18 +29,6 @@ function notice(text = "") {
 function connection(text, tone) {
   $("connection").textContent = text;
   $("connection").className = `pill ${tone}`;
-}
-
-function showAuth() {
-  if (!$("auth").open) $("auth").showModal();
-}
-
-function authError(error) {
-  if (error.status !== 401) return false;
-  authNeeded = true;
-  connection("Access key required", "warn");
-  showAuth();
-  return true;
 }
 
 function createFilter(name, label, values) {
@@ -113,7 +100,7 @@ function restartPoll() {
 }
 
 async function poll() {
-  if (active || document.hidden || authNeeded) return;
+  if (active || document.hidden) return;
   const current = generation;
   const controller = new AbortController();
   active = controller;
@@ -155,7 +142,7 @@ async function poll() {
     $("next").disabled = !nextCursor;
     $("page-number").textContent = `Page ${cursorStack.length}`;
   } catch (error) {
-    if (error.name === "AbortError" || current !== generation || authError(error)) return;
+    if (error.name === "AbortError" || current !== generation) return;
     failureCount++;
     connection(lastRefresh ? "Stale" : "Offline", "warn");
     notice(lastRefresh ? `Refresh failed. Showing data from ${time(lastRefresh)}. ${error.message}` : error.message);
@@ -163,7 +150,7 @@ async function poll() {
     active = undefined;
     const delay = refreshPending ? 0 : Math.min(30_000, 2000 * 2 ** failureCount);
     refreshPending = false;
-    if (!authNeeded && !document.hidden) timer = setTimeout(poll, delay);
+    if (!document.hidden) timer = setTimeout(poll, delay);
   }
 }
 
@@ -200,22 +187,12 @@ function copyEvents() {
 
 async function exportRange(format) {
   try { await download({ ...preferences, format }); }
-  catch (error) { if (!authError(error)) notice(error.message); }
+  catch (error) { notice(error.message); }
 }
 
 document.querySelectorAll("[data-view]").forEach((tab) => tab.addEventListener("click", () => goto(tab.dataset.view)));
 document.querySelectorAll("[data-close]").forEach((item) => item.addEventListener("click", () => $(item.dataset.close).close()));
 $("refresh").addEventListener("click", restartPoll);
-$("access").addEventListener("click", showAuth);
-$("auth-form").addEventListener("submit", (event) => {
-  event.preventDefault();
-  setAccessKey($("key").value.trim());
-  $("key").value = "";
-  authNeeded = false;
-  $("auth").close();
-  restartPoll();
-});
-$("auth").addEventListener("close", () => { $("key").value = ""; });
 $("inspector").addEventListener("close", () => { detailFetch?.abort(); inspected = undefined; });
 $("next").addEventListener("click", () => { if (nextCursor) { cursorStack.push(nextCursor); restartPoll(); } });
 $("previous").addEventListener("click", () => { if (cursorStack.length > 1) { cursorStack.pop(); restartPoll(); } });

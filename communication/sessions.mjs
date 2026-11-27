@@ -1,62 +1,55 @@
-import { randomBytes, randomUUID } from "node:crypto";
-import { digest, identifier, roles, tokenPattern, workerProfile } from "./config.mjs";
+import { createHash, randomUUID } from "node:crypto";
+import { identifier, roles } from "./config.mjs";
 import { GatewayError } from "./protocol.mjs";
 
 const fields = ["clientId", "factoryRunId", "role"];
 
-export function createWorkerRegistry(config, busy, now = Date.now) {
+export function createSessionRegistry(config, busy, now = Date.now) {
   const leases = new Map();
-  const tokens = new Map();
-  const expired = (worker) => worker.revoked || worker.expiresAt <= now();
+  const expired = (worker) => worker.closed || worker.expiresAt <= now();
 
   function reap() {
     for (const [sessionId, worker] of leases) {
       if (!expired(worker) || busy.has(worker.scope)) continue;
       leases.delete(sessionId);
-      tokens.delete(worker.tokenKey);
     }
   }
 
-  const summary = (worker) => ({ sessionId: worker.sessionId, runTag: worker.runTag,
+  const summary = (worker) => ({ sessionId: worker.sessionId, apiBase: `/sessions/${worker.sessionId}/v1`, runTag: worker.runTag,
     role: worker.role, expiresAt: new Date(worker.expiresAt).toISOString() });
 
   return {
-    lookup(authorization) {
+    lookup(sessionId) {
       reap();
-      if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) return null;
-      const token = authorization.slice(7);
-      if (!tokenPattern.test(token)) return null;
-      const key = digest(token);
-      const worker = tokens.get(key);
-      return worker && !expired(worker) ? worker : config.byToken.get(key);
+      const worker = leases.get(sessionId);
+      return worker && !expired(worker) ? worker : undefined;
     },
     register(body) {
       if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).some((key) => !fields.includes(key)) ||
-        [body.clientId, body.factoryRunId].some((id) => typeof id !== "string" || !identifier.test(id)) || !roles.includes(body.role)) {
-        throw new GatewayError(400, "invalid_session", "Provide clientId, factoryRunId and a supported role for a new worker.");
+        [body.clientId, body.factoryRunId].some((id) => id !== undefined && (typeof id !== "string" || !identifier.test(id))) ||
+        (body.role !== undefined && !roles.includes(body.role))) {
+        throw new GatewayError(400, "invalid_session", "Use an empty object or provide valid clientId, factoryRunId and role labels.");
       }
       reap();
-      if (leases.size + config.byToken.size >= config.maxSessions) {
-        throw new GatewayError(429, "session_capacity", "Worker session capacity is exhausted. Revoke an unused session or wait for it to expire.");
+      if (leases.size >= config.maxSessions) {
+        throw new GatewayError(429, "session_capacity", "Session capacity is exhausted. Close an unused session or wait for it to expire.");
       }
-      const token = randomBytes(32).toString("base64url");
-      const tokenKey = digest(token);
       const sessionId = randomUUID();
-      const worker = { ...workerProfile(config.epoch, { ...body, sessionId }), tokenKey, sessionId, expiresAt: now() + config.sessionMs };
+      const runTag = body.factoryRunId && createHash("sha256").update(`${config.epoch}/${body.factoryRunId}`).digest("hex").slice(0, 16);
+      const worker = { clientId: body.clientId ?? sessionId, sessionId, runTag, role: body.role,
+        scope: `${config.epoch}/${sessionId}`, expiresAt: now() + config.sessionMs };
       leases.set(sessionId, worker);
-      tokens.set(tokenKey, worker);
-      return { ...summary(worker), token };
+      return summary(worker);
     },
     list() {
       reap();
       return [...leases.values()].filter((worker) => !expired(worker)).map(summary);
     },
-    revoke(sessionId) {
+    close(sessionId) {
       reap();
       const worker = leases.get(sessionId);
       if (!worker || expired(worker)) return null;
-      worker.revoked = true;
-      tokens.delete(worker.tokenKey);
+      worker.closed = true;
       reap();
       return worker;
     },

@@ -15,7 +15,7 @@ const modelReply = "Synthetic fixture complete.";
 async function run(mode, preview = false) {
   const logDir = await mkdtemp(join(tmpdir(), "gateway-monitor-measure-"));
   const gateway = spawn(process.execPath, ["--input-type=module", "-e", entry], { stdio: ["ignore", "pipe", "inherit", "ipc"], env: {
-    ...process.env, PORT: "0", CHATGPT_GATEWAY_API_KEY: "", CHATGPT_GATEWAY_EXTENSION_ORIGIN: "",
+    ...process.env, PORT: "0", CHATGPT_GATEWAY_EXTENSION_ORIGIN: "",
     CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS: "0", CHATGPT_GATEWAY_MAX_PROMPT_BYTES: "0", CHATGPT_GATEWAY_TEXT_ATTACHMENT_FALLBACK: "true",
     CHATGPT_GATEWAY_MONITOR_ENABLED: String(mode !== "disabled"), CHATGPT_GATEWAY_MONITOR_PERSIST: String(mode === "jsonl"),
     CHATGPT_GATEWAY_MONITOR_LOG_DIR: logDir,

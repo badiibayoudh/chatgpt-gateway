@@ -3,14 +3,12 @@ import { chatMessages } from "../chat-tools.mjs";
 import { toolCallKeys } from "../chat-history.mjs";
 import { clientContext, estimateTokens } from "../context.mjs";
 import { errors, safeModel, safeName, uuid } from "../monitoring/events.mjs";
-import { apiKeyMatches } from "./config.mjs";
 import { checkResultHistory, GatewayError, readBody, validateOutput } from "./protocol.mjs";
-import { createWorkerRegistry } from "./sessions.mjs";
+import { createSessionRegistry } from "./sessions.mjs";
 
 const reserveLimit = 32 * 1024 * 1024;
 const error = (status, code, message, opts) => new GatewayError(status, code, message, opts);
 const offline = () => error(503, "upstream_uncertain", "Gateway dispatch is paused because upstream completion could not be confirmed. Reconcile before restarting.");
-const unauthorized = () => error(401, "unauthorized", "Use an authorized Gateway bearer key.");
 const frame = (value) => `data: ${JSON.stringify(value)}\n\n`;
 const paths = ["/v1/sessions", "/v1/factory/sessions"];
 const monitorCode = (code) => ({
@@ -73,16 +71,14 @@ export function createGateway(config, settings, monitor, transport) {
   const waiting = new Map();
   const retained = new Map();
   const busy = new Set();
-  const workers = createWorkerRegistry(config, busy);
-  const legacy = { clientId: "legacy", scope: `legacy/${config.epoch}`, legacy: true };
+  const sessions = createSessionRegistry(config, busy);
+  const defaultSession = { clientId: "default", scope: `default/${config.epoch}`, legacy: !!transport.legacyInteractive };
   let retainedBytes = 0;
   let active;
   let paused = transport.blocked === true;
   const totals = { accepted: 0, completed: 0, failed: 0, cancelled: 0, timedOut: 0, overloaded: 0, maxObservedActive: 0,
     incomingRequestBytes: 0, incomingRequestCharacters: 0, estimatedInputTokens: 0, estimatedOutputTokens: 0,
     oversizedRequestCount: 0, lastQueueWaitMs: null };
-  const admin = (req) => apiKeyMatches(config.admin, req.headers.authorization);
-  const monitorAllowed = (header) => !config.admin || apiKeyMatches(config.admin, header);
 
   function release(entry) {
     clearTimeout(entry.timer);
@@ -262,24 +258,19 @@ export function createGateway(config, settings, monitor, transport) {
 
   async function manageSessions(req, res, path, collection) {
     try {
-      if (req.headers.origin && req.headers.origin.toLowerCase() !== `http://${req.headers.host.toLowerCase()}`) {
-        throw error(403, "local_origin_required", "Use the Gateway's own loopback origin for session management.");
-      }
-      if (!config.scopedManagement) throw error(503, "session_management_disabled", "Configure a strong Gateway admin key to manage scoped clients.");
-      if (!admin(req)) throw unauthorized();
       if (path === collection && req.method === "POST") {
-        const { body } = await readBody(req, 4096);
-        if (!res.destroyed) writeJson(res, 201, workers.register(body));
+        const { body } = await readBody(req, 4096, { allowEmpty: true });
+        if (!res.destroyed) writeJson(res, 201, sessions.register(body));
       } else if (path === collection && req.method === "GET") {
-        writeJson(res, 200, { items: workers.list() });
+        writeJson(res, 200, { items: sessions.list() });
       } else if (path !== collection && req.method === "DELETE") {
         const id = path.slice(collection.length + 1);
         if (!uuid.test(id)) throw error(400, "invalid_session", "Use the issued Gateway session identifier.");
-        const worker = workers.revoke(id);
+        const worker = sessions.close(id);
         if (worker) for (const entry of retained.values()) {
-          if (entry.worker === worker) terminal(entry, "cancelled", error(409, "session_revoked", "The Gateway admin revoked this worker session."));
+          if (entry.worker === worker) terminal(entry, "cancelled", error(409, "session_closed", "The local Gateway session was closed."));
         }
-        writeJson(res, 200, { revoked: !!worker });
+        writeJson(res, 200, { closed: !!worker });
       } else {
         res.setHeader("Allow", path === collection ? "GET, POST" : "DELETE");
         throw error(405, "method_not_allowed", "Use an available method for worker session management.");
@@ -290,26 +281,20 @@ export function createGateway(config, settings, monitor, transport) {
     }
   }
 
-  function capabilities(req) {
-    const credential = admin(req) ? "admin" : workers.lookup(req.headers.authorization) ? "worker" : "none";
+  function capabilities(scoped) {
     const availability = paused ? { state: "blocked" } : transport.availability();
-    const scopedAvailable = config.scopedManagement && (transport.scopedReady?.() ?? true);
+    const scopedAvailable = transport.scopedReady?.() ?? true;
     const features = transport.capabilities;
-    const canSubmit = (credential === "worker" && scopedAvailable) ||
-      (!config.requireScoped && (!config.admin || credential === "admin"));
-    const requestReady = features.programmatic && canSubmit && ["connected", "simulated", "verified"].includes(availability.state);
+    const requestReady = features.programmatic && (!scoped || scopedAvailable) && ["connected", "simulated", "verified"].includes(availability.state);
     const unattendedReady = requestReady && features.unattended === true && !features.simulated &&
       scopedAvailable && availability.state === "verified";
-    return { schemaVersion: 1, connectivity: "connected", authentication: {
-      configured: !!config.admin, credential, required: config.requireScoped || !!config.admin, sessionRegistration: config.scopedManagement,
-    }, clients: { multiClient: config.maxSessions >= 2, maxSessions: config.maxSessions, sessionIsolation: "scoped",
-      scopedAvailable, legacyAvailable: !config.requireScoped },
+    return { schemaVersion: 1, connectivity: "connected", clients: { multiClient: config.maxSessions >= 2,
+      maxSessions: config.maxSessions, sessionIsolation: "scoped", scopedAvailable, legacyAvailable: true },
       transport: { id: transport.id, capabilities: features, availability, requestReady, unattendedReady,
         programmaticReady: unattendedReady } };
   }
 
   return {
-    monitorAllowed,
     snapshot: () => {
       const browser = transport.metrics?.();
       return { ...browser, ...totals, oversizedRequestCount: totals.oversizedRequestCount + (browser?.oversizedRequestCount ?? 0),
@@ -318,25 +303,21 @@ export function createGateway(config, settings, monitor, transport) {
         maxQueued: config.maxQueued, maxPerClient: config.maxPerClient, retainedBytes, activeRequestId: active?.id ?? null, paused };
     },
     async route(req, res, path) {
-      if (req.method === "GET" && path === "/v1/capabilities") { writeJson(res, 200, capabilities(req)); return true; }
       const collection = paths.find((prefix) => path === prefix || path.startsWith(prefix + "/"));
       if (collection) { await manageSessions(req, res, path, collection); return true; }
+      const scoped = /^\/sessions\/([^/]+)(\/v1(?:\/.*)?)$/.exec(path);
+      const worker = scoped ? sessions.lookup(scoped[1]) : defaultSession;
+      if (!worker) {
+        req.resume();
+        reject(res, error(404, "session_not_found", "Create a new session and use the returned API base path."));
+        return true;
+      }
+      if (scoped) path = scoped[2];
+      if (req.method === "GET" && path === "/v1/capabilities") { writeJson(res, 200, capabilities(!!scoped)); return true; }
       const post = req.method === "POST" && path === "/v1/chat/completions";
       const cancel = req.method === "DELETE" && path.startsWith("/v1/requests/");
       const models = req.method === "GET" && path === "/v1/models";
       if (!post && !cancel && !models) return false;
-      const worker = workers.lookup(req.headers.authorization) ??
-        (!config.requireScoped && monitorAllowed(req.headers.authorization) ? legacy : undefined);
-      if (!worker) {
-        req.resume();
-        reject(res, unauthorized());
-        return true;
-      }
-      if (Object.keys(req.headers).some((name) => /^x-(?:gateway|factory)-(?:client|session|principal|run|issue|role)/i.test(name))) {
-        req.resume();
-        reject(res, error(403, "identity_mismatch", "Client and session identity come from the scoped worker key."));
-        return true;
-      }
       if (post) await complete(req, res, worker);
       else if (models) writeJson(res, 200, { object: "list", data: transport.models.map((id) => ({ id, object: "model", owned_by: "gateway" })) });
       else {

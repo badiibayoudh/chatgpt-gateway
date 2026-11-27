@@ -7,18 +7,14 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { gatewayConfig } from "../communication/config.mjs";
-import { createWorkerRegistry } from "../communication/sessions.mjs";
+import { createSessionRegistry } from "../communication/sessions.mjs";
 import { openAiTransport } from "../communication/programmatic-transports.mjs";
 
-const adminKey = "factory-admin-fixture-00000000";
-const profiles = ["one", "two", "three"].map((key) => ({ token: `factory-worker-fixture-${key}-0000`,
-  clientId: `fixture-${key}`, sessionId: "shared-session-name", factoryRunId: "fixture-private-run-name", role: "developer" }));
-const fixtureEnv = { CHATGPT_GATEWAY_FACTORY_TRANSPORT: "mock", CHATGPT_GATEWAY_API_KEY: adminKey,
-  CHATGPT_GATEWAY_FACTORY_CLIENTS: JSON.stringify(profiles) };
+const fixtureEnv = { CHATGPT_GATEWAY_TRANSPORT: "mock" };
 const user = (content = "identical fixture prompt") => ({ role: "user", content });
 const tools = [{ type: "function", function: { name: "read_fixture", parameters: { type: "object", additionalProperties: false } } }];
 
-async function start(t, env = {}) {
+async function start(t, env = {}, sessionCount = 3) {
   const child = spawn(process.execPath, ["server.mjs"], { env: { ...process.env, ...fixtureEnv, PORT: "0",
     CHATGPT_GATEWAY_MAX_CONTEXT_TOKENS: "0", CHATGPT_GATEWAY_MONITOR_ENABLED: "true", CHATGPT_GATEWAY_MONITOR_PERSIST: "false", ...env } });
   const stop = async () => {
@@ -38,14 +34,20 @@ async function start(t, env = {}) {
       if (match) resolve(match[1]);
     });
   });
-  const call = (path, token, options = {}) => fetch(`http://127.0.0.1:${port}${path}`, { ...options, headers: {
-    ...(token && { Authorization: `Bearer ${token}` }), ...options.headers } });
-  const complete = (index, messages, rest = {}, options = {}) => call("/v1/chat/completions", profiles[index]?.token, {
+  const call = (path, options) => fetch(`http://127.0.0.1:${port}${path}`, options);
+  const sessions = [];
+  for (let i = 0; i < sessionCount; i++) {
+    const response = await call("/v1/sessions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ clientId: `fixture-${i}`, factoryRunId: "fixture-private-run-name", role: "developer" }) });
+    assert.equal(response.status, 201);
+    sessions.push(await response.json());
+  }
+  const complete = (index, messages, rest = {}, options = {}) => call(`${sessions[index]?.apiBase ?? "/v1"}/chat/completions`, {
     ...options, method: "POST", headers: { "Content-Type": "application/json", ...options.headers },
     body: JSON.stringify({ model: "factory-mock", messages, ...rest }),
   });
-  const read = async (path) => (await call(path, adminKey)).json();
-  return { complete, call, read, stop };
+  const read = async (path) => (await call(path)).json();
+  return { complete, call, read, stop, sessions };
 }
 
 async function waitFor(fn) {
@@ -88,7 +90,7 @@ test("scoped workers with identical prompts and tools receive distinct calls and
   assert.equal(new Set(requests.items.map(({ conversationId }) => conversationId)).size, 2);
   assert.equal(new Set(requests.items.map(({ runTag }) => runTag)).size, 1);
   const json = JSON.stringify(await gateway.read("/monitor/export"));
-  assert.doesNotMatch(json, /fixture private result|fixture-private-run-name|identical fixture prompt|factory-worker-fixture/);
+  assert.doesNotMatch(json, /fixture private result|fixture-private-run-name|identical fixture prompt/);
 });
 
 test("one execution slot, scoped cancellation, admission and drain after active cancellation", { timeout: 10000 }, async (t) => {
@@ -102,7 +104,7 @@ test("one execution slot, scoped cancellation, admission and drain after active 
   assert.equal(overflow.status, 429);
   assert.equal(overflow.headers.get("retry-after"), "2");
   async function cancel(id, index) {
-    return (await (await gateway.call(`/v1/requests/${id}`, profiles[index].token, { method: "DELETE" })).json()).cancelled;
+    return (await (await gateway.call(`${gateway.sessions[index].apiBase}/requests/${id}`, { method: "DELETE" })).json()).cancelled;
   }
   assert.equal(await cancel(request.requestId, 0), false);
   assert.equal(await cancel(request.requestId, 1), true);
@@ -142,11 +144,11 @@ test("queue and processing deadlines release only settled jobs and bridge client
   assert.equal((await gateway.complete(1, [user()])).status, 200);
 });
 
-test("factory streaming, restart reset, authorization, and provider errors", { timeout: 10000 }, async (t) => {
+test("keyless default access, scoped streaming, restart reset and provider errors", { timeout: 10000 }, async (t) => {
   const first = await start(t);
-  assert.equal((await first.complete(-1, [user()])).status, 401);
-  assert.equal((await first.call("/monitor/status", profiles[0].token)).status, 401);
-  assert.equal((await first.complete(0, [user()], {}, { headers: { "X-Gateway-Session-Id": "foreign" } })).status, 403);
+  assert.equal((await first.complete(-1, [user()])).status, 200);
+  assert.equal((await first.call("/monitor/status")).status, 200);
+  assert.equal((await first.call("/sessions/unknown/v1/models")).status, 404);
   const sse = await first.complete(0, [user()], { stream: true, stream_options: { include_usage: true } });
   const stream = await sse.text();
   assert.match(stream, /Mock reply /);
@@ -159,6 +161,7 @@ test("factory streaming, restart reset, authorization, and provider errors", { t
   const asst = (await (await first.complete(0, [user()], { tools })).json()).choices[0].message;
   await first.stop();
   const restarted = await start(t);
+  assert.equal((await restarted.call(`${first.sessions[0].apiBase}/capabilities`)).status, 404);
   const stale = await restarted.complete(0, [user(), asst, { role: "tool", content: "{}", tool_call_id: asst.tool_calls[0].id }], { tools });
   assert.equal((await stale.json()).error.code, "session_reset");
   assert.equal((await restarted.complete(0, [user()])).status, 200);
@@ -169,7 +172,6 @@ test("factory streaming, restart reset, authorization, and provider errors", { t
 });
 
 test("programmatic adapter retains native schemas, usage and SSE without contacting a provider", async () => {
-  assert.throws(() => gatewayConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: JSON.stringify([profiles[0], profiles[0]]) }), /Duplicate/);
   const progress = [];
   const transmitted = [];
   const mockedFetch = async (url, options) => {
@@ -206,64 +208,59 @@ test("programmatic slot checkpoint survives an uncertain outcome and prevents re
   await assert.rejects(confirmed.complete({}, options), { code: "upstream_uncertain" });
 });
 
-test("administrator provisions, lists and revokes bounded worker sessions without restarting", { timeout: 10000 }, async (t) => {
-  const gateway = await start(t, { CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "2" });
-  const sessions = "/v1/factory/sessions";
+test("local callers create, list and close bounded sessions without credentials", { timeout: 10000 }, async (t) => {
+  const gateway = await start(t, { CHATGPT_GATEWAY_MAX_SESSIONS: "2" }, 0);
+  const sessions = "/v1/sessions";
   const request = { clientId: "dedicated-worker", factoryRunId: "issue-pilot", role: "developer" };
-  const issue = (key = adminKey, body = request, headers = {}) => gateway.call(sessions, key, {
+  const issue = (body = request, headers = {}) => gateway.call(sessions, {
     method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body),
   });
-  const chat = (token, content = "fixture:hello") => gateway.call("/v1/chat/completions", token, {
+  const chat = (session, content = "fixture:hello") => gateway.call(`${session.apiBase}/chat/completions`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "factory-mock", messages: [user(content)] }),
   });
-  assert.equal((await issue(profiles[0].token)).status, 401);
-  assert.equal((await issue(adminKey, { ...request, sessionId: "claimed-by-client" })).status, 400);
-  assert.equal((await issue(adminKey, request, { Origin: "http://localhost:1" })).status, 403);
+  assert.equal((await issue({ ...request, sessionId: "claimed-by-client" })).status, 400);
+  assert.equal((await issue(request, { Origin: "http://localhost:1" })).status, 403);
   const issued1 = await issue();
-  const issued2 = await issue(adminKey, { ...request, role: "reviewer" });
+  const issued2 = await issue({ ...request, role: "reviewer" });
   assert.equal(issued1.status, 201);
   assert.equal(issued2.status, 201);
   assert.equal(issued1.headers.get("cache-control"), "no-store");
   const first = await issued1.json();
   const second = await issued2.json();
-  assert.notEqual(first.token, second.token);
+  assert.match(first.apiBase, new RegExp(`/sessions/${first.sessionId}/v1$`));
   assert.notEqual(first.sessionId, second.sessionId);
   assert.equal(first.runTag, second.runTag);
   assert.equal((await issue()).status, 429);
-  assert.equal((await issue(first.token)).status, 401);
   const listing = await gateway.read(sessions);
   assert.deepEqual(listing.items.map(({ sessionId }) => sessionId), [first.sessionId, second.sessionId]);
   assert.ok(listing.items.every((item) => !Object.hasOwn(item, "token")));
-  assert.equal((await chat(adminKey)).status, 401);
-  const slow = chat(first.token, "fixture:slow");
+  const slow = chat(first, "fixture:slow");
   await waitFor(async () => (await gateway.read("/metrics")).activeSlots);
-  const revoke = (id, token) => gateway.call(`${sessions}/${id}`, token, { method: "DELETE" });
-  assert.equal((await revoke(first.sessionId, second.token)).status, 401);
-  assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, true);
-  assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, false);
-  assert.equal((await (await slow).json()).error.code, "session_revoked");
-  assert.equal((await chat(first.token)).status, 401);
+  const close = (id) => gateway.call(`${sessions}/${id}`, { method: "DELETE" });
+  assert.equal((await (await close(first.sessionId)).json()).closed, true);
+  assert.equal((await (await close(first.sessionId)).json()).closed, false);
+  assert.equal((await (await slow).json()).error.code, "session_closed");
+  assert.equal((await chat(first)).status, 404);
   assert.equal((await gateway.read("/metrics")).activeSlots, 1);
   assert.equal((await issue()).status, 429);
-  const other = await chat(second.token);
+  const other = await chat(second);
   assert.equal(other.status, 200);
-  assert.equal((await issue()).status, 201);
+  assert.equal((await gateway.call(sessions, { method: "POST" })).status, 201);
   const exported = JSON.stringify(await gateway.read("/monitor/export"));
-  assert.ok(!exported.includes(first.token) && !exported.includes(second.token) && !exported.includes(request.factoryRunId));
+  assert.ok(!exported.includes(first.sessionId) && !exported.includes(second.sessionId) && !exported.includes(request.factoryRunId));
 });
 
-test("an expired session rejects credentials while its in-flight slot keeps the lease", () => {
-  const config = gatewayConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "1" });
+test("an expired session rejects new requests while its in-flight slot keeps the lease", () => {
+  const config = gatewayConfig({ ...fixtureEnv, CHATGPT_GATEWAY_MAX_SESSIONS: "1" });
   const busy = new Set();
   let clock = 0;
-  const registry = createWorkerRegistry(config, busy, () => clock);
+  const registry = createSessionRegistry(config, busy, () => clock);
   const request = { clientId: "worker", factoryRunId: "run", role: "developer" };
   const lease = registry.register(request);
-  const auth = `Bearer ${lease.token}`;
-  const { scope } = registry.lookup(auth);
+  const { scope } = registry.lookup(lease.sessionId);
   busy.add(scope);
   clock = config.sessionMs;
-  assert.equal(registry.lookup(auth), undefined);
+  assert.equal(registry.lookup(lease.sessionId), undefined);
   assert.deepEqual(registry.list(), []);
   assert.throws(() => registry.register(request), { code: "session_capacity" });
   busy.delete(scope);

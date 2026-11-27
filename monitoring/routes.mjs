@@ -8,7 +8,6 @@ const assets = new Map([
   ["/dashboard/assets/api.js", ["api.js", "text/javascript"]], ["/dashboard/assets/views.js", ["views.js", "text/javascript"]],
 ]);
 const version = await readFile(new URL("../package.json", import.meta.url), "utf8").then((file) => JSON.parse(file).version).catch(() => null);
-const authorized = (req) => !req.headers.origin || req.headers.origin.toLowerCase() === `http://${req.headers.host.toLowerCase()}`;
 export const isMonitorPath = (url) => /^\/(?:monitor|dashboard)(?:\/|$)/.test(url);
 
 function json(res, status, data) {
@@ -57,7 +56,7 @@ function page(items, key, filter) {
   return { items: ordered.slice(0, limit), nextCursor: ordered.length > limit ? ordered[limit - 1][key] : null };
 }
 
-export function monitorRoutes(monitor, getCore, hasApiKey) {
+export function monitorRoutes(monitor, getCore) {
   const cache = new Map();
   const envelope = () => ({ schemaVersion: 1, sessionId: monitor.sessionId, startedAt: monitor.startedAt, retention: monitor.retention() });
   const eventFilters = ["limit", "requestId", "level", "component", "event", "code", "from", "to"];
@@ -68,11 +67,7 @@ export function monitorRoutes(monitor, getCore, hasApiKey) {
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader("X-Frame-Options", "DENY");
     res.setHeader("Referrer-Policy", "no-referrer");
-    if (!authorized(req)) { fail(res, 403, "local_origin_required", "Use the dashboard from its own local origin."); return true; }
     if (!monitor.enabled) { fail(res, 404, "monitor_disabled", "Gateway monitoring is disabled."); return true; }
-    if (!pathname.startsWith("/dashboard") && !hasApiKey(req.headers.authorization)) {
-      fail(res, 401, "unauthorized", "Enter the configured gateway API key."); return true;
-    }
     if (req.method !== "GET") { res.setHeader("Allow", "GET"); fail(res, 405, "read_only", "Monitoring routes are read-only."); return true; }
     try {
       if (assets.has(pathname)) {
