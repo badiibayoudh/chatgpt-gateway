@@ -474,7 +474,7 @@ async function handleHttp(req, res) {
     return;
   }
 
-  if (factory && await factory.route(req, res, path)) return;
+  if (factory && await factory.route(req, res, path, hasApiKey(req.headers.authorization))) return;
 
   if (!hasApiKey(req.headers.authorization)) {
     errorResponse(res, 401, "Use the configured gateway API key as a Bearer token");

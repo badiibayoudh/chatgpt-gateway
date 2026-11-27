@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { factoryConfig } from "../communication/factory-config.mjs";
+import { createWorkerRegistry } from "../communication/factory-sessions.mjs";
 import { openAiTransport } from "../communication/factory-transport.mjs";
 
 const adminKey = "factory-admin-fixture-00000000";
@@ -201,4 +202,68 @@ test("programmatic slot checkpoint survives an uncertain outcome and prevents re
   assert.deepEqual(Object.keys(saved).sort(), ["requestId", "startedAt"]);
   assert.equal(openAiTransport(config).ready(), false);
   await assert.rejects(confirmed.complete({}, options), { code: "upstream_uncertain" });
+});
+
+test("administrator provisions, lists and revokes bounded worker sessions without restarting", { timeout: 10000 }, async (t) => {
+  const gateway = await start(t, { CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "2" });
+  const sessions = "/v1/factory/sessions";
+  const request = { clientId: "dedicated-worker", factoryRunId: "issue-pilot", role: "developer" };
+  const issue = (key = adminKey, body = request, headers = {}) => gateway.call(sessions, key, {
+    method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body),
+  });
+  const chat = (token, content = "fixture:hello") => gateway.call("/v1/chat/completions", token, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "factory-mock", messages: [user(content)] }),
+  });
+  assert.equal((await issue(profiles[0].token)).status, 401);
+  assert.equal((await issue(adminKey, { ...request, sessionId: "claimed-by-client" })).status, 400);
+  assert.equal((await issue(adminKey, request, { Origin: "http://localhost:1" })).status, 403);
+  const issued1 = await issue();
+  const issued2 = await issue(adminKey, { ...request, role: "reviewer" });
+  assert.equal(issued1.status, 201);
+  assert.equal(issued2.status, 201);
+  assert.equal(issued1.headers.get("cache-control"), "no-store");
+  const first = await issued1.json();
+  const second = await issued2.json();
+  assert.notEqual(first.token, second.token);
+  assert.notEqual(first.sessionId, second.sessionId);
+  assert.equal(first.runTag, second.runTag);
+  assert.equal((await issue()).status, 429);
+  assert.equal((await issue(first.token)).status, 401);
+  const listing = await gateway.read(sessions);
+  assert.deepEqual(listing.items.map(({ sessionId }) => sessionId), [first.sessionId, second.sessionId]);
+  assert.ok(listing.items.every((item) => !Object.hasOwn(item, "token")));
+  assert.equal((await chat(adminKey)).status, 401);
+  const slow = chat(first.token, "fixture:slow");
+  await waitFor(async () => (await gateway.read("/metrics")).factory.activeSlots);
+  const revoke = (id, token) => gateway.call(`${sessions}/${id}`, token, { method: "DELETE" });
+  assert.equal((await revoke(first.sessionId, second.token)).status, 401);
+  assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, true);
+  assert.equal((await (await revoke(first.sessionId, adminKey)).json()).revoked, false);
+  assert.equal((await (await slow).json()).error.code, "session_revoked");
+  assert.equal((await chat(first.token)).status, 401);
+  assert.equal((await gateway.read("/metrics")).factory.activeSlots, 1);
+  assert.equal((await issue()).status, 429);
+  const other = await chat(second.token);
+  assert.equal(other.status, 200);
+  assert.equal((await issue()).status, 201);
+  const exported = JSON.stringify(await gateway.read("/monitor/export"));
+  assert.ok(!exported.includes(first.token) && !exported.includes(second.token) && !exported.includes(request.factoryRunId));
+});
+
+test("an expired session rejects credentials while its in-flight slot keeps the lease", () => {
+  const config = factoryConfig({ ...fixtureEnv, CHATGPT_GATEWAY_FACTORY_CLIENTS: "[]", CHATGPT_GATEWAY_FACTORY_MAX_SESSIONS: "1" });
+  const busy = new Set();
+  let clock = 0;
+  const registry = createWorkerRegistry(config, busy, () => clock);
+  const request = { clientId: "worker", factoryRunId: "run", role: "developer" };
+  const lease = registry.register(request);
+  const auth = `Bearer ${lease.token}`;
+  const { scope } = registry.lookup(auth);
+  busy.add(scope);
+  clock = config.sessionMs;
+  assert.equal(registry.lookup(auth), undefined);
+  assert.deepEqual(registry.list(), []);
+  assert.throws(() => registry.register(request), { code: "session_capacity" });
+  busy.delete(scope);
+  assert.notEqual(registry.register(request).sessionId, lease.sessionId);
 });

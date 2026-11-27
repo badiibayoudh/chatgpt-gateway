@@ -21,6 +21,7 @@ export const errors = {
   upstream_uncertain: "Provider completion could not be confirmed. Factory dispatch is paused.",
   upstream_rate_limit: "The provider reported a rate or usage limit.", upstream_rejected: "The provider rejected the request.",
   upstream_authorization: "The provider denied access to the configured project or model.",
+  session_revoked: "The Gateway admin revoked the factory worker session.",
 };
 const code = (value) => Object.hasOwn(errors, value);
 const knownCaps = ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1"];

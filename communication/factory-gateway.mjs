@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { toolCallKeys } from "../chat-history.mjs";
 import { clientContext, estimateTokens } from "../context.mjs";
-import { safeModel, safeName } from "../monitoring/events.mjs";
-import { workerFor } from "./factory-config.mjs";
+import { safeModel, safeName, uuid } from "../monitoring/events.mjs";
 import { checkResultHistory, FactoryError, prepareFactoryPayload, readFactoryBody, validateOutput } from "./factory-protocol.mjs";
+import { createWorkerRegistry } from "./factory-sessions.mjs";
 import { mockTransport, openAiTransport } from "./factory-transport.mjs";
 
 const json = (res, status, data) => {
@@ -58,8 +58,8 @@ function output(res, payload, requestId) {
 export function createFactoryGateway(config, settings, monitor, transport = config.mode === "mock" ? mockTransport() : openAiTransport(config)) {
   const waiting = new Map();
   const retained = new Map();
-  const sessions = new Map();
   const busy = new Set();
+  const workers = createWorkerRegistry(config, busy);
   let retainedBytes = 0;
   let active;
   let paused = transport.ready?.() === false;
@@ -87,10 +87,10 @@ export function createFactoryGateway(config, settings, monitor, transport = conf
     const { res, id, worker, prepared, context } = entry;
     const { payload, selection } = prepared;
     const scope = worker.scope;
-    let session = sessions.get(scope);
+    let session = worker.history;
     if (!session || session.expires <= Date.now()) {
       session = { calls: new Map() };
-      sessions.set(scope, session);
+      worker.history = session;
     }
     session.expires = Date.now() + config.sessionMs;
     const observe = (event, name) => monitor.emit(event, id, { name: safeName(name) ?? "redacted" });
@@ -214,16 +214,52 @@ export function createFactoryGateway(config, settings, monitor, transport = conf
     }
   }
 
+  async function manageSessions(req, res, path, admin) {
+    const collection = "/v1/factory/sessions";
+    try {
+      if (req.headers.origin && req.headers.origin.toLowerCase() !== `http://${req.headers.host.toLowerCase()}`) {
+        throw error(403, "local_origin_required", "Use the Gateway's own loopback origin for session management.");
+      }
+      if (!admin) throw error(401, "unauthorized", "Session management requires the Gateway admin key.");
+      if (path === collection && req.method === "POST") {
+        const { body } = await readFactoryBody(req, 4096);
+        if (!res.destroyed) json(res, 201, workers.register(body));
+      } else if (path === collection && req.method === "GET") {
+        json(res, 200, { items: workers.list() });
+      } else if (path !== collection && req.method === "DELETE") {
+        const id = path.slice(collection.length + 1);
+        if (!uuid.test(id)) throw error(400, "invalid_session", "Use the issued factory session identifier.");
+        const worker = workers.revoke(id);
+        if (worker) {
+          for (const entry of retained.values()) {
+            if (entry.worker === worker) terminal(entry, "cancelled", error(409, "session_revoked", "The Gateway admin revoked this worker session."));
+          }
+        }
+        json(res, 200, { revoked: !!worker });
+      } else {
+        res.setHeader("Allow", path === collection ? "GET, POST" : "DELETE");
+        throw error(405, "method_not_allowed", "Use an available method for worker session management.");
+      }
+    } catch (cause) {
+      req.resume();
+      reject(res, cause instanceof FactoryError ? cause : error(400, "invalid_session", "The worker session request could not be read."));
+    }
+  }
+
   return {
     snapshot: () => ({ transport: config.mode, ready: !paused, capabilities: transport.capabilities, activeSlots: Number(!!active), queued: waiting.size, pending: retained.size,
       maxQueued: config.maxQueued, maxPerClient: config.maxPerClient, retainedBytes, ...totals }),
     activeId: () => active?.id ?? null,
-    async route(req, res, path) {
+    async route(req, res, path, admin) {
+      if (path === "/v1/factory/sessions" || path.startsWith("/v1/factory/sessions/")) {
+        await manageSessions(req, res, path, admin);
+        return true;
+      }
       const post = req.method === "POST" && path === "/v1/chat/completions";
       const cancel = req.method === "DELETE" && path.startsWith("/v1/requests/");
       const models = req.method === "GET" && path === "/v1/models";
       if (!post && !cancel && !models) return false;
-      const worker = workerFor(config, req.headers.authorization);
+      const worker = workers.lookup(req.headers.authorization);
       if (!worker) {
         req.resume();
         reject(res, error(401, "unauthorized", "Use an authorized, scoped factory worker bearer key."));
