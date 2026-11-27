@@ -133,7 +133,9 @@ async function poll() {
     if (current !== generation) return;
     if (data.sessionId !== status.sessionId) { refreshPending = true; return; }
     currentRows = data.items;
-    connection(status.health.extensionConnected ? "Gateway online" : "Extension disconnected", status.health.extensionConnected ? "good" : "warn");
+    const factory = status.health.factory;
+    if (factory) connection(factory.ready ? `Factory online (${factory.transport})` : "Factory dispatch paused", factory.ready ? "good" : "warn");
+    else connection(status.health.extensionConnected ? "Gateway online" : "Extension disconnected", status.health.extensionConnected ? "good" : "warn");
     lastRefresh = Date.now();
     $("refresh-status").textContent = `Updated ${new Date(lastRefresh).toLocaleTimeString()}`;
     if (failureCount) notice();

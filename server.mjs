@@ -9,6 +9,8 @@ import { clientContext, contextSettings, estimateTokens } from "./context.mjs";
 import { createMonitor } from "./monitoring/index.mjs";
 import { isMonitorPath, monitorRoutes } from "./monitoring/routes.mjs";
 import { browserError, monitorCapabilities, safeModel, safeName } from "./monitoring/events.mjs";
+import { factoryConfig } from "./communication/factory-config.mjs";
+import { createFactoryGateway } from "./communication/factory-gateway.mjs";
 
 const PORT = parseInt(process.env.PORT || "18790", 10);
 const MAX_BROWSER_WAIT = 240_000;
@@ -20,6 +22,8 @@ const API_KEY = process.env.CHATGPT_GATEWAY_API_KEY;
 const EXTENSION_ORIGIN = process.env.CHATGPT_GATEWAY_EXTENSION_ORIGIN;
 const settings = contextSettings();
 const monitor = createMonitor();
+const factorySettings = factoryConfig(process.env);
+const factory = factorySettings ? createFactoryGateway(factorySettings, settings, monitor) : null;
 monitor.emit("gateway.started");
 const extensionCapabilities = new WeakMap();
 const conversations = new Map();
@@ -414,14 +418,16 @@ function healthSnapshot() {
   const caps = extensionCapabilities.get(extensionWs);
   return { status: "ok", extensionConnected: !!extensionWs,
     imageAttachments: caps?.has("imageAttachments") ?? false, conversationReuse: caps?.has("conversationReuse") ?? false,
-    longMessageFallback: settings.textAttachmentFallback && (caps?.has("longMessageFallback") ?? false), pendingRequests: pending.size };
+    longMessageFallback: settings.textAttachmentFallback && (caps?.has("longMessageFallback") ?? false), pendingRequests: factory?.snapshot().pending ?? pending.size,
+    ...(factory && { factory: { transport: factorySettings.mode, ready: factory.snapshot().ready } }) };
 }
 
 function metricsSnapshot() {
   const percent = (part, total) => total ? Math.round(10_000 * part / total) / 100 : 0;
   const textBytesSent = metrics.outgoingPromptBytes + metrics.textAttachmentBytes;
   return {
-    ...metrics, pendingRequests: pending.size, browserBusy: !!activeRequest,
+    ...metrics, pendingRequests: factory?.snapshot().pending ?? pending.size, browserBusy: !!activeRequest,
+    ...(factory && { factory: factory.snapshot() }),
     conversationReuseSuccessRate: percent(metrics.conversationReuseSuccesses, metrics.continuationRequests),
     toolDefinitionReuseRate: percent(metrics.toolDefinitionReuses, metrics.toolDefinitionRequests),
     redundantDataAvoidedPercent: percent(Math.max(0, metrics.fullContextBaselineBytes - textBytesSent), metrics.fullContextBaselineBytes),
@@ -429,8 +435,8 @@ function metricsSnapshot() {
 }
 
 const serveMonitor = monitorRoutes(monitor, () => ({
-  health: healthSnapshot(), metrics: metricsSnapshot(), activeRequestId: activeRequest?.requestId ?? null,
-  queued: pending.size - Number(pending.has(activeRequest?.requestId)),
+  health: healthSnapshot(), metrics: metricsSnapshot(), activeRequestId: factory?.activeId() ?? activeRequest?.requestId ?? null,
+  queued: factory ? factory.snapshot().queued : pending.size - Number(pending.has(activeRequest?.requestId)),
   capabilities: monitorCapabilities(extensionCapabilities.get(extensionWs)),
   configuration: { ...settings, apiKeyRequired: !!API_KEY, extensionOriginRestricted: !!EXTENSION_ORIGIN, connectionMode: "loopback", maxBodyBytes: MAX_BODY_BYTES,
     ...(monitor.config && { requestRetention: monitor.config.requests, eventRetention: monitor.config.events,
@@ -467,6 +473,8 @@ async function handleHttp(req, res) {
     res.end(JSON.stringify(healthSnapshot()));
     return;
   }
+
+  if (factory && await factory.route(req, res, path)) return;
 
   if (!hasApiKey(req.headers.authorization)) {
     errorResponse(res, 401, "Use the configured gateway API key as a Bearer token");
@@ -694,11 +702,11 @@ async function handleHttp(req, res) {
 }
 
 function listener() {
-  const server = createServer(handleHttp);
+  const server = factory ? createServer({ requestTimeout: 60_000, connectionsCheckingInterval: 5_000 }, handleHttp) : createServer(handleHttp);
   server.on("upgrade", (req, socket, head) => {
     const origin = req.headers.origin;
     const allowed = EXTENSION_ORIGIN ? origin === EXTENSION_ORIGIN : !origin || extensionOrigin(origin);
-    if (req.url !== "/ws" || !loopbackHost(req.headers.host) || !allowed) {
+    if (factory || req.url !== "/ws" || !loopbackHost(req.headers.host) || !allowed) {
       socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
       return;
     }

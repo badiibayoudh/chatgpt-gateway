@@ -110,6 +110,7 @@ function createEnabled(config, now, clock, logStore) {
     request.firstSequence ??= sequence;
     request.lastSequence = sequence;
     switch (event) {
+      case "request.received": Object.assign(request, data); break;
       case "request.input": Object.assign(request, data); break;
       case "request.queued": request.state = "queued"; request._queued = tick; break;
       case "request.dispatched":
@@ -122,6 +123,10 @@ function createEnabled(config, now, clock, logStore) {
         break;
       case "browser.generation_detected": if (request._submitted !== undefined) request.generationStartMs = tick - request._submitted; break;
       case "browser.reply_relayed": if (request._dispatch !== undefined) request.browserMs = tick - request._dispatch; break;
+      case "transport.started": request.state = "processing"; request._transportAt = tick; break;
+      case "transport.finished": if (request._transportAt !== undefined) request.serviceMs = tick - request._transportAt; break;
+      case "transport.usage": request.providerUsage = data; break;
+      case "transport.transmitted": Object.assign(request, data); break;
       case "context.prepared": Object.assign(request, data); break;
       case "context.matched": case "context.reuse_missed": request.reuseReason = data.reason; break;
       case "context.reused": request.sameChatObserved = true; break;

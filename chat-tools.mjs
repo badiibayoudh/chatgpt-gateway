@@ -10,7 +10,7 @@ function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function selectTools({ tools = [], tool_choice = "auto", parallel_tool_calls }) {
+export function selectTools({ tools = [], tool_choice = "auto", parallel_tool_calls }) {
   if (!Array.isArray(tools)) throw new Error("tools must be an array");
 
   const forcedName = tool_choice?.type === "function" ? tool_choice.function?.name : undefined;
@@ -132,7 +132,7 @@ function decodeCodeReply(content, requestId) {
   return { content: reply.content };
 }
 
-function compileTools(functions) {
+export function compileTools(functions) {
   const validatorOptions = {
     strict: false,
     ownProperties: true,

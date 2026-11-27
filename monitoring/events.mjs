@@ -16,6 +16,11 @@ export const errors = {
   invalid_response: "The model response could not be decoded.", revised_response: "ChatGPT revised text that was already streamed.",
   queue_timeout: "The client timed out while waiting for the browser slot.", browser_timeout: "The client timed out while waiting for the browser response.",
   client_disconnected: "The client closed the response connection.", client_cancelled: "The client cancelled the request.",
+  processing_timeout: "The factory request exceeded the provider processing deadline.",
+  session_reset: "The tool history could not be verified in this factory session.",
+  upstream_uncertain: "Provider completion could not be confirmed. Factory dispatch is paused.",
+  upstream_rate_limit: "The provider reported a rate or usage limit.", upstream_rejected: "The provider rejected the request.",
+  upstream_authorization: "The provider denied access to the configured project or model.",
 };
 const code = (value) => Object.hasOwn(errors, value);
 const knownCaps = ["imageAttachments", "conversationReuse", "longMessageFallback", "continuationOnly", "attachmentPolicy", "contextMetrics", "telemetryV1"];
@@ -40,7 +45,8 @@ const sizes = { incomingBytes: isNumber, incomingCharacters: isNumber, logicalBy
 export const schemas = {
   "gateway.started": {}, "gateway.extension_connected": {}, "gateway.extension_disconnected": {},
   "gateway.extension_capabilities": { capabilities: (value) => Array.isArray(value) && value.length <= knownCaps.length && value.every((cap) => knownCaps.includes(cap)) },
-  "request.received": {}, "request.input": { ...sizes, model: (value) => safeModel(value) === value },
+  "request.received": { role: oneOf("planner", "architect", "developer", "reviewer", "test-analyst"), transport: oneOf("mock", "openai"),
+    runTag: (value) => typeof value === "string" && /^[a-f0-9]{16}$/.test(value) }, "request.input": { ...sizes, model: (value) => safeModel(value) === value },
   "request.queued": {}, "request.dispatched": {}, "request.completed": { estimatedOutputTokens: isNumber },
   "request.failed": { code }, "request.cancelled": { code }, "request.timed_out": { code },
   "context.matched": { reason: oneOf(...reasons) }, "context.reuse_missed": { reason: oneOf(...reasons) },
@@ -48,6 +54,8 @@ export const schemas = {
     forwardedMessages: isNumber, exposedTools: isNumber, toolDefinitionBytes: isNumber, toolsReused: isBool },
   "context.transmitted": { forwardedTextBytes: isNumber, forwardedCharacters: isNumber, textAttachmentBytes: isNumber, fallback: isBool },
   "context.reused": {},
+  "transport.started": {}, "transport.finished": {}, "transport.usage": { authoritative: isBool, input: isNumber, output: isNumber },
+  "transport.transmitted": { wireBytes: isNumber, wireCharacters: isNumber },
   "browser.tab_located": {}, "browser.tab_unavailable": {}, "browser.prompt_submitted": {},
   "browser.generation_detected": {}, "browser.response_received": { characters: isNumber },
   "browser.reply_relayed": { ok: isBool }, "browser.prompt_rejected": { code },
