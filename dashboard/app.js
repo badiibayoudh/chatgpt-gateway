@@ -134,7 +134,7 @@ async function poll() {
     if (data.sessionId !== status.sessionId) { refreshPending = true; return; }
     currentRows = data.items;
     const backend = status.health.gateway;
-    if (backend?.programmatic) {
+    if (backend && !backend.interactive) {
       const label = { simulated: "Mock transport", verified: "Provider verified", blocked: "Dispatch paused", unavailable: "Provider unavailable" }[backend.availability];
       connection(label ?? "Provider unverified", backend.availability === "verified" ? "good" : "warn");
     } else connection(status.health.extensionConnected ? "Interactive Gateway" : "Extension disconnected", status.health.extensionConnected ? "good" : "warn");

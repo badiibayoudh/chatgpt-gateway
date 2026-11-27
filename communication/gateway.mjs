@@ -294,13 +294,18 @@ export function createGateway(config, settings, monitor, transport) {
     const credential = admin(req) ? "admin" : workers.lookup(req.headers.authorization) ? "worker" : "none";
     const availability = paused ? { state: "blocked" } : transport.availability();
     const scopedAvailable = config.scopedManagement && (transport.scopedReady?.() ?? true);
-    const programmatic = transport.capabilities.programmatic && !transport.capabilities.simulated;
+    const features = transport.capabilities;
+    const canSubmit = (credential === "worker" && scopedAvailable) ||
+      (!config.requireScoped && (!config.admin || credential === "admin"));
+    const requestReady = features.programmatic && canSubmit && ["connected", "simulated", "verified"].includes(availability.state);
+    const unattendedReady = requestReady && features.unattended === true && !features.simulated &&
+      scopedAvailable && availability.state === "verified";
     return { schemaVersion: 1, connectivity: "connected", authentication: {
       configured: !!config.admin, credential, required: config.requireScoped || !!config.admin, sessionRegistration: config.scopedManagement,
     }, clients: { multiClient: config.maxSessions >= 2, maxSessions: config.maxSessions, sessionIsolation: "scoped",
       scopedAvailable, legacyAvailable: !config.requireScoped },
-    transport: { id: transport.id, capabilities: transport.capabilities, availability,
-      programmaticReady: programmatic && scopedAvailable && availability.state === "verified" } };
+      transport: { id: transport.id, capabilities: features, availability, requestReady, unattendedReady,
+        programmaticReady: unattendedReady } };
   }
 
   return {

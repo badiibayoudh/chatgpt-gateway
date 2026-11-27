@@ -40,6 +40,7 @@ function healthSnapshot(snapshot = gateway.snapshot()) {
   const availability = snapshot.paused ? "blocked" : transport.availability().state;
   return { status: "ok", ...legacy, pendingRequests: snapshot.pending,
     gateway: { transport: transport.id, availability, programmatic: transport.capabilities.programmatic,
+      interactive: transport.capabilities.interactive, unattended: transport.capabilities.unattended,
       simulated: transport.capabilities.simulated } };
 }
 

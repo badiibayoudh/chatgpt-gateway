@@ -300,7 +300,7 @@ export function browserTransport(settings, monitor) {
 
   return {
     id: "browser", models: ["auto"], legacyInteractive: true,
-    capabilities: { programmatic: false, simulated: false, streaming: true, toolCalls: true,
+    capabilities: { programmatic: true, interactive: true, unattended: false, simulated: false, streaming: true, toolCalls: true,
       cancellation: "drain", concurrency: 1, contextLimit: "browser" },
     availability: () => ({ state: extensionWs?.readyState === WebSocket.OPEN ? "connected" : "disconnected" }),
     legacyHealth: () => {

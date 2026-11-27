@@ -106,7 +106,8 @@ export function openAiTransport(config, request = fetch) {
     ready: lease?.ready,
     blocked: startsBlocked,
     availability: () => startsBlocked ? { state: "blocked" } : Date.now() - Date.parse(observation.observedAt) > 300_000 ? { state: "unverified" } : observation,
-    capabilities: { programmatic: true, simulated: false, streaming: true, toolCalls: true, cancellation: "drain", concurrency: 1, contextLimit: "provider" },
+    capabilities: { programmatic: true, interactive: false, unattended: true, simulated: false, streaming: true,
+      toolCalls: true, cancellation: "drain", concurrency: 1, contextLimit: "provider" },
     prepare: (payload) => prepareNativePayload(payload, config.models),
     async complete(payload, { requestId, progress, transmitted }) {
       await lease?.acquire(requestId);
@@ -172,7 +173,8 @@ export function mockTransport() {
   return {
     id: "mock", models,
     availability: () => ({ state: "simulated" }),
-    capabilities: { programmatic: true, simulated: true, streaming: true, toolCalls: true, cancellation: "drain", concurrency: 1, contextLimit: "gateway" },
+    capabilities: { programmatic: true, interactive: false, unattended: false, simulated: true, streaming: true,
+      toolCalls: true, cancellation: "drain", concurrency: 1, contextLimit: "gateway" },
     prepare: (payload) => prepareNativePayload(payload, models),
     async complete(payload, { requestId, progress }) {
       const latest = payload.messages.at(-1);

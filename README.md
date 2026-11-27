@@ -237,6 +237,16 @@ $second = Invoke-RestMethod "$base/sessions" -Method Post -Headers $headers -Con
 4. Set Cline's local API key to the issued value in `$first.token` and Continue's to `$second.token`. Both use the same base URL and model. Each key follows its own conversation and tool history. Requests from both clients can queue. The one browser slot runs them in order.
 5. Revoke a key with `DELETE /v1/sessions/:id` using the admin key. A running request keeps its slot until the adapter settles even after its client response has been cancelled.
 
+A script you start while the signed-in ChatGPT tab is available can submit through the same session. In PowerShell, use a scoped key issued above.
+
+```powershell
+$workerHeaders = @{ Authorization = "Bearer $($first.token)" }
+$request = @{ model = 'auto'; messages = @(@{ role = 'user'; content = 'What is 1 + 3?' }) }
+$reply = Invoke-RestMethod "$base/chat/completions" -Method Post -Headers $workerHeaders `
+    -ContentType 'application/json' -Body ($request | ConvertTo-Json -Depth 5)
+$reply.choices[0].message.content
+```
+
 Temporary keys expire after `CHATGPT_GATEWAY_SESSION_MS` and are cleared by restart. `GET /v1/sessions` lists active temporary sessions without token values. Optional deployment-managed browser or programmatic profiles can be loaded using `CHATGPT_GATEWAY_CLIENTS` with `token`, `clientId`, `sessionId`, `factoryRunId`, and `role`. Roles are `planner`, `architect`, `developer`, `reviewer`, and `test-analyst`. Static and temporary profiles share a 32-session limit by default.
 
 Existing browser clients with a shared or omitted key use a single legacy identity. Set `CHATGPT_GATEWAY_REQUIRE_SCOPED_CLIENTS=true` after migrating clients to individual keys to enforce isolation for all interactive requests. Scoped browser replies wait for conversation ownership to be confirmed before content is returned. They work through the existing ChatGPT tab and return policy or quota rejections to the caller.
@@ -249,7 +259,7 @@ Existing browser clients with a shared or omitted key use a single legacy identi
 | `mock` | Deterministic tests with model `factory-mock` | Local admin and scoped worker keys |
 | `openai` | Optional authorized Chat Completions adapter | Provider project key in `CHATGPT_GATEWAY_OPENAI_API_KEY`, model allowlist in `CHATGPT_GATEWAY_MODELS`, private state directory in `CHATGPT_GATEWAY_STATE_DIR`, and local scoped keys |
 
-The server selects one backend per process. `GET /v1/capabilities` reports connectivity, verified bearer scope if supplied, client isolation, adapter features, observed backend availability, and programmatic readiness. The browser connection and mock fixture are reported as distinct states. The OpenAI adapter remains unverified until it observes a successful provider response and returns to unverified when that evidence ages out. Keep an `upstream-in-flight.json` marker after an uncertain provider operation until the operator can reconcile it.
+The server selects one backend per process. Send your bearer key to `GET /v1/capabilities` to check `transport.requestReady` for that credential. `transport.capabilities.programmatic` identifies adapters callable through HTTP. The browser advertises `interactive: true` and `unattended: false`. `transport.unattendedReady` is reserved for verified, authorized unattended execution. The OpenAI adapter remains unverified until it observes a successful provider response and returns to unverified when that evidence ages out. Keep an `upstream-in-flight.json` marker after an uncertain provider operation until the operator can reconcile it.
 
 The common queue defaults to eight waiting requests and one active execution. Scoped clients may hold up to two requests across their sessions. See [the architecture revision](doc/Unified_Gateway_Architecture.md) for limits, adapter contract and verification. Existing `CHATGPT_GATEWAY_FACTORY_*` settings and `/v1/factory/sessions` remain compatible aliases.
 
